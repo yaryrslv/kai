@@ -330,17 +330,18 @@ def _build_test_app(
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
-    # Workspace config for review agent repo resolution. The workspace
-    # path parent name ("repo") matches the test payload repo name so
-    # _resolve_local_repo() finds it via the home workspace check.
-    app["workspace"] = "/home/user/repo/workspace"
+    # Workspace config for review agent repo resolution
     app["workspace_base"] = None
     app["allowed_workspaces"] = []
     app["spec_dir"] = "specs"
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
-    app["chat_id"] = 12345
+    app["allowed_user_ids"] = {12345}
+    # Set a workspace matching the test repo name ("owner/repo") so _users_for_repo
+    # routes notifications to our test user. Without this, unmatched repos get no
+    # notifications (by design — only users with matching workspaces are notified).
+    app["user_workspaces"] = {12345: "/workspace/repo"}
     app.router.add_post("/webhook/github", _handle_github)
     return app
 
@@ -364,6 +365,12 @@ def _mock_resolve_repo():
 
 class TestPRReviewRouting:
     """Integration tests for PR review routing in _handle_github."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_notification_settings(self):
+        """Mock sessions.get_setting to allow notifications by default."""
+        with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns, _mock_resolve_repo):
@@ -567,8 +574,8 @@ class TestResolveLocalRepo:
     """Tests for workspace-aware repo resolution."""
 
     @pytest.mark.asyncio
-    async def test_home_workspace(self, tmp_path):
-        """Resolves via home workspace when parent dir name matches repo."""
+    async def test_user_workspace(self, tmp_path):
+        """Resolves via user workspace when parent dir name matches repo."""
         # Create a directory structure like /tmp/.../kai/workspace
         repo_dir = tmp_path / "kai"
         repo_dir.mkdir()
@@ -576,7 +583,7 @@ class TestResolveLocalRepo:
         workspace_dir.mkdir()
 
         app = web.Application()
-        app["workspace"] = str(workspace_dir)
+        app["user_workspaces"] = {12345: str(workspace_dir)}
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
@@ -591,7 +598,7 @@ class TestResolveLocalRepo:
         anvil_dir.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
+        app["user_workspaces"] = {}
         app["workspace_base"] = str(tmp_path)
         app["allowed_workspaces"] = []
 
@@ -605,7 +612,7 @@ class TestResolveLocalRepo:
         myrepo.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
+        app["user_workspaces"] = {}
         app["workspace_base"] = None
         app["allowed_workspaces"] = [str(myrepo)]
 
@@ -613,28 +620,20 @@ class TestResolveLocalRepo:
         assert result == str(myrepo)
 
     @pytest.mark.asyncio
-    async def test_workspace_history(self, tmp_path):
-        """Resolves via workspace_history entries from the database."""
-        history_repo = tmp_path / "historic"
-        history_repo.mkdir()
-
+    async def test_workspace_history_removed(self, tmp_path):
+        """workspace_history fallback was removed; returns None."""
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
+        app["user_workspaces"] = {}
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[{"path": str(history_repo)}],
-        ):
-            result = await _resolve_local_repo("owner/historic", app)
-        assert result == str(history_repo)
+        result = await _resolve_local_repo("owner/historic", app)
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_priority_order(self, tmp_path):
-        """Home workspace wins over workspace_base."""
-        # Both home and base have a matching "kai" directory
+        """User workspace wins over workspace_base."""
+        # Both user workspace and base have a matching "kai" directory
         home_repo = tmp_path / "home" / "kai"
         home_repo.mkdir(parents=True)
         home_workspace = home_repo / "workspace"
@@ -645,44 +644,34 @@ class TestResolveLocalRepo:
         base_kai.mkdir(parents=True)
 
         app = web.Application()
-        app["workspace"] = str(home_workspace)
+        app["user_workspaces"] = {12345: str(home_workspace)}
         app["workspace_base"] = str(base_dir)
         app["allowed_workspaces"] = []
 
         result = await _resolve_local_repo("dcellison/kai", app)
-        # Home workspace should win
+        # User workspace should win
         assert result == str(home_repo)
 
     @pytest.mark.asyncio
     async def test_no_match(self, tmp_path):
         """Returns None when no workspace matches the repo."""
         app = web.Application()
-        app["workspace"] = str(tmp_path / "unrelated" / "workspace")
+        app["user_workspaces"] = {}
         app["workspace_base"] = str(tmp_path)
         app["allowed_workspaces"] = []
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[],
-        ):
-            result = await _resolve_local_repo("owner/nonexistent", app)
+        result = await _resolve_local_repo("owner/nonexistent", app)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_nonexistent_dir_skipped(self, tmp_path):
-        """History entries pointing to deleted directories are skipped."""
+        """Non-existent directories in allowed_workspaces are skipped."""
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
+        app["user_workspaces"] = {}
         app["workspace_base"] = None
-        app["allowed_workspaces"] = []
+        app["allowed_workspaces"] = ["/gone/deleted-repo"]
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[{"path": "/gone/deleted-repo"}],
-        ):
-            result = await _resolve_local_repo("owner/deleted-repo", app)
+        result = await _resolve_local_repo("owner/deleted-repo", app)
         assert result is None
 
     @pytest.mark.asyncio
@@ -741,6 +730,12 @@ def _make_issue_payload(action: str = "opened", issue_number: int = 10) -> dict:
 
 class TestIssueTriageRouting:
     """Integration tests for issue triage routing in _handle_github."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_notification_settings(self):
+        """Mock sessions.get_setting to allow notifications by default."""
+        with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns):

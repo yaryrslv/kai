@@ -24,15 +24,15 @@ of Claude's response before acting on it.
 
 import asyncio
 import json
-import logging
 import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+import structlog
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.triage")
 
 
 # Triage model - Sonnet, same reasoning as PR review. Background task,
@@ -180,12 +180,12 @@ async def search_related_issues(repo: str, title: str, body: str) -> str:
 
         if proc.returncode != 0:
             error = stderr.decode().strip()
-            log.warning("gh issue list --search failed for %s: %s", repo, error)
+            log.warning("related_issues.search_failed", repo=repo, error=error)
             return "[]"
 
         return stdout.decode().strip() or "[]"
     except Exception:
-        log.exception("Failed to search related issues for %s", repo)
+        log.exception("related_issues.search_error", repo=repo)
         return "[]"
 
 
@@ -218,12 +218,12 @@ async def list_projects(owner: str) -> str:
 
         if proc.returncode != 0:
             error = stderr.decode().strip()
-            log.warning("gh project list failed for %s: %s", owner, error)
+            log.warning("projects.list_failed", owner=owner, error=error)
             return "[]"
 
         return stdout.decode().strip() or "[]"
     except Exception:
-        log.exception("Failed to list projects for %s", owner)
+        log.exception("projects.list_error", owner=owner)
         return "[]"
 
 
@@ -471,14 +471,9 @@ async def _ensure_label_exists(repo: str, label: str) -> None:
     _, stderr = await proc.communicate()
 
     if proc.returncode == 0:
-        log.info("Created label '%s' in %s", label, repo)
+        log.info("label.created", label=label, repo=repo)
     else:
-        log.warning(
-            "Failed to create label '%s' in %s: %s",
-            label,
-            repo,
-            stderr.decode().strip(),
-        )
+        log.warning("label.create_failed", label=label, repo=repo, error=stderr.decode().strip())
 
 
 async def apply_triage(
@@ -487,6 +482,7 @@ async def apply_triage(
     webhook_port: int,
     webhook_secret: str,
     projects_json: str = "[]",
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -502,6 +498,8 @@ async def apply_triage(
         webhook_secret: Secret for authenticating with the send-message API.
         projects_json: Raw JSON from list_projects(), reused to avoid a
             redundant gh project list call when looking up project numbers.
+        user_ids: List of user IDs to notify. Each gets a separate request
+            with X-User-Id header for proper multi-user routing.
     """
     # Type-guard Claude's response fields. Claude may return wrong types
     # (e.g., "labels": "bug" instead of ["bug"], or ["bug", 42, null]).
@@ -552,15 +550,9 @@ async def apply_triage(
         _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            log.warning(
-                "Failed to add label '%s' to %s#%d: %s",
-                label,
-                metadata.repo,
-                metadata.number,
-                stderr.decode().strip(),
-            )
+            log.warning("label.add_failed", label=label, repo=metadata.repo, issue_number=metadata.number, error=stderr.decode().strip())
         else:
-            log.info("Added label '%s' to %s#%d", label, metadata.repo, metadata.number)
+            log.info("label.added", label=label, repo=metadata.repo, issue_number=metadata.number)
 
     # Step 2: Add to project board if assigned.
     # Reuses projects_json from the earlier list_projects() call instead of
@@ -596,24 +588,13 @@ async def apply_triage(
                 _, stderr = await proc.communicate()
 
                 if proc.returncode == 0:
-                    log.info(
-                        "Added %s#%d to project '%s'",
-                        metadata.repo,
-                        metadata.number,
-                        project,
-                    )
+                    log.info("project.item_added", repo=metadata.repo, issue_number=metadata.number, project=project)
                 else:
-                    log.warning(
-                        "Failed to add %s#%d to project '%s': %s",
-                        metadata.repo,
-                        metadata.number,
-                        project,
-                        stderr.decode().strip(),
-                    )
+                    log.warning("project.item_add_failed", repo=metadata.repo, issue_number=metadata.number, project=project, error=stderr.decode().strip())
             else:
-                log.warning("Project '%s' not found for %s", project, owner)
+                log.warning("project.not_found", project=project, owner=owner)
         except Exception:
-            log.exception("Failed to add %s#%d to project", metadata.repo, metadata.number)
+            log.exception("project.item_add_error", repo=metadata.repo, issue_number=metadata.number)
 
     # Step 3: Post triage comment
     labels_str = ", ".join(new_labels) if new_labels else "(none added)"
@@ -654,14 +635,9 @@ async def apply_triage(
         _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            log.error(
-                "Failed to post triage comment on %s#%d: %s",
-                metadata.repo,
-                metadata.number,
-                stderr.decode().strip(),
-            )
+            log.error("triage.comment_failed", repo=metadata.repo, issue_number=metadata.number, error=stderr.decode().strip())
         else:
-            log.info("Posted triage comment on %s#%d", metadata.repo, metadata.number)
+            log.info("triage.comment_posted", repo=metadata.repo, issue_number=metadata.number)
 
     # Step 4: Send Telegram notification
     telegram_parts = [
@@ -681,20 +657,22 @@ async def apply_triage(
 
     text = "\n".join(telegram_parts)
     url = f"http://localhost:{webhook_port}/api/send-message"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Secret": webhook_secret,
-    }
 
-    try:
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
-        ):
-            if resp.status != 200:
-                log.warning("send-message API returned %d for triage summary", resp.status)
-    except Exception:
-        log.exception("Failed to send triage summary to Telegram")
+    for uid in (user_ids or []):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": webhook_secret,
+            "X-User-Id": str(uid),
+        }
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(url, json={"text": text}, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    log.warning("triage.notify_failed", status=resp.status, user_id=uid)
+        except Exception:
+            log.exception("triage.notify_error", user_id=uid)
 
 
 async def triage_issue(
@@ -702,6 +680,7 @@ async def triage_issue(
     webhook_port: int,
     webhook_secret: str,
     claude_user: str | None = None,
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -719,7 +698,11 @@ async def triage_issue(
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
+        user_ids: List of user IDs to notify with the triage summary.
     """
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(operation="issue_triage")
+
     # Metadata extraction is inside try/except so a malformed payload
     # doesn't produce an unhandled exception in the background task.
     metadata: IssueMetadata | None = None
@@ -741,8 +724,8 @@ async def triage_issue(
         raw_response = await run_triage(prompt, claude_user=claude_user)
 
         if not raw_response.strip():
-            log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)
-            await _send_error_notification(metadata, "Empty response from Claude", webhook_port, webhook_secret)
+            log.warning("triage.empty_output", repo=metadata.repo, issue_number=metadata.number)
+            await _send_error_notification(metadata, "Empty response from Claude", webhook_port, webhook_secret, user_ids=user_ids)
             return
 
         # Step 5: Parse the JSON response
@@ -750,14 +733,10 @@ async def triage_issue(
 
         # Step 6: Apply triage (labels, project, comment, telegram).
         # Pass projects JSON to avoid a redundant gh project list call.
-        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects)
+        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects, user_ids=user_ids)
 
     except Exception as exc:
-        log.exception(
-            "Triage failed for %s#%d",
-            metadata.repo if metadata else "unknown",
-            metadata.number if metadata else 0,
-        )
+        log.exception("triage.failed", repo=metadata.repo if metadata else "unknown", issue_number=metadata.number if metadata else 0)
         # Best-effort failure notification so the user knows something broke.
         # If metadata extraction itself failed, we can't build a useful
         # notification, so just log and bail.
@@ -769,13 +748,10 @@ async def triage_issue(
                 str(exc),
                 webhook_port,
                 webhook_secret,
+                user_ids=user_ids,
             )
         except Exception:
-            log.exception(
-                "Failed to send failure notification for %s#%d",
-                metadata.repo,
-                metadata.number,
-            )
+            log.exception("triage.failure_notify_error", repo=metadata.repo, issue_number=metadata.number)
 
 
 async def _send_error_notification(
@@ -783,6 +759,7 @@ async def _send_error_notification(
     error_detail: str,
     webhook_port: int,
     webhook_secret: str,
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Send a triage failure notification to Telegram.
@@ -795,20 +772,20 @@ async def _send_error_notification(
         error_detail: Brief description of what went wrong.
         webhook_port: Local webhook server port.
         webhook_secret: Secret for authenticating with the send-message API.
+        user_ids: List of user IDs to notify.
     """
     text = f"Issue triage failed for {metadata.repo}#{metadata.number}: {error_detail}"
     url = f"http://localhost:{webhook_port}/api/send-message"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Secret": webhook_secret,
-    }
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(url, json={"text": text}, headers=headers) as resp,
-    ):
-        if resp.status != 200:
-            log.warning(
-                "send-message API returned %d for triage error notification",
-                resp.status,
-            )
+    for uid in (user_ids or []):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": webhook_secret,
+            "X-User-Id": str(uid),
+        }
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(url, json={"text": text}, headers=headers) as resp,
+        ):
+            if resp.status != 200:
+                log.warning("triage.error_notify_failed", status=resp.status, user_id=uid)

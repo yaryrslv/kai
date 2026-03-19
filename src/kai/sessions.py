@@ -4,21 +4,22 @@ SQLite database layer for sessions, jobs, settings, and workspace history.
 Provides async CRUD operations for all persistent state in Kai, organized
 into four tables:
 
-1. **sessions** — Claude Code session tracking (session ID, model, cost).
-   One row per chat_id, upserted on each response. Cost accumulates across
+1. **sessions** -- Claude Code session tracking (session ID, model, cost).
+   One row per user_id, upserted on each response. Cost accumulates across
    the lifetime of a session.
 
-2. **jobs** — Scheduled tasks (reminders, Claude jobs, conditional monitors).
+2. **jobs** -- Scheduled tasks (reminders, Claude jobs, conditional monitors).
    Created via the scheduling API (POST /api/schedule) or inner Claude's curl.
    Jobs have a schedule_type (once/daily/interval) and can be deactivated
-   without deletion to preserve history.
+   without deletion to preserve history. Each job belongs to a user_id
+   and targets a chat_id for message delivery.
 
-3. **settings** — Generic key-value store for persistent config. Used for
+3. **settings** -- Per-user key-value store for persistent config. Used for
    workspace path, voice mode/name preferences, and future extensibility.
-   Keys are namespaced strings like "voice_mode:{chat_id}".
+   Composite primary key (user_id, key).
 
-4. **workspace_history** — Recently used workspace paths for the /workspaces
-   inline keyboard. Sorted by last_used_at for recency ordering.
+4. **workspace_history** -- Per-user recently used workspace paths for the
+   /workspaces inline keyboard. Sorted by last_used_at for recency ordering.
 
 All functions use a module-level aiosqlite connection initialized by init_db()
 at startup. The database file is kai.db at the project root.
@@ -56,9 +57,19 @@ async def init_db(db_path: Path) -> None:
     global _db
     _db = await aiosqlite.connect(str(db_path))
     _get_db().row_factory = aiosqlite.Row
+
+    # WAL mode allows concurrent readers during writes — essential for
+    # multi-user operation where parallel users may write simultaneously.
+    # busy_timeout makes SQLite retry for 5s on lock contention instead
+    # of immediately failing with "database is locked".
+    await _get_db().execute("PRAGMA journal_mode=WAL")
+    await _get_db().execute("PRAGMA busy_timeout=5000")
+
+    # Create tables with multi-user schema (user_id as primary identity)
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS sessions (
-            chat_id INTEGER PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
             session_id TEXT NOT NULL,
             model TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -69,6 +80,7 @@ async def init_db(db_path: Path) -> None:
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             job_type TEXT NOT NULL,
@@ -81,22 +93,20 @@ async def init_db(db_path: Path) -> None:
             notify_on_check INTEGER DEFAULT 0
         )
     """)
-
-    # Schema evolution: add notify_on_check column to existing databases that don't have it
-    cursor = await _get_db().execute("PRAGMA table_info(jobs)")
-    columns = [row[1] for row in await cursor.fetchall()]
-    if "notify_on_check" not in columns:
-        await _get_db().execute("ALTER TABLE jobs ADD COLUMN notify_on_check INTEGER DEFAULT 0")
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+            user_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (user_id, key)
         )
     """)
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS workspace_history (
-            path TEXT PRIMARY KEY,
-            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, path)
         )
     """)
     await _get_db().commit()
@@ -105,52 +115,54 @@ async def init_db(db_path: Path) -> None:
 # ── Session management ───────────────────────────────────────────────
 
 
-async def get_session(chat_id: int) -> str | None:
-    """Get the current Claude session ID for a chat, or None if no session exists."""
-    async with _get_db().execute("SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)) as cursor:
+async def get_session(user_id: int) -> str | None:
+    """Get the current Claude session ID for a user, or None if no session exists."""
+    async with _get_db().execute("SELECT session_id FROM sessions WHERE user_id = ?", (user_id,)) as cursor:
         row = await cursor.fetchone()
         return row["session_id"] if row else None
 
 
-async def save_session(chat_id: int, session_id: str, model: str, cost_usd: float) -> None:
+async def save_session(user_id: int, chat_id: int, session_id: str, model: str, cost_usd: float) -> None:
     """
-    Save or update a Claude session for a chat.
+    Save or update a Claude session for a user.
 
-    On conflict (existing chat_id), the session_id and model are updated,
+    On conflict (existing user_id), the session_id and model are updated,
     last_used_at is refreshed, and total_cost_usd is accumulated (not replaced).
 
     Args:
-        chat_id: Telegram chat ID.
+        user_id: Telegram user ID (primary identity).
+        chat_id: Telegram chat ID (for message delivery).
         session_id: Claude session identifier from the stream-json response.
         model: Model name used for this session (e.g., "sonnet").
         cost_usd: Cost of this particular interaction (added to running total).
     """
     await _get_db().execute(
         """
-        INSERT INTO sessions (chat_id, session_id, model, total_cost_usd)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
+        INSERT INTO sessions (user_id, chat_id, session_id, model, total_cost_usd)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            chat_id = excluded.chat_id,
             session_id = excluded.session_id,
             model = excluded.model,
             last_used_at = CURRENT_TIMESTAMP,
             total_cost_usd = total_cost_usd + excluded.total_cost_usd
     """,
-        (chat_id, session_id, model, cost_usd),
+        (user_id, chat_id, session_id, model, cost_usd),
     )
     await _get_db().commit()
 
 
-async def clear_session(chat_id: int) -> None:
-    """Delete the session record for a chat. Used by /new and workspace switching."""
-    await _get_db().execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
+async def clear_session(user_id: int) -> None:
+    """Delete the session record for a user. Used by /new and workspace switching."""
+    await _get_db().execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
     await _get_db().commit()
 
 
-async def get_stats(chat_id: int) -> dict | None:
+async def get_stats(user_id: int) -> dict | None:
     """Get session statistics for the /stats command. Returns None if no session exists."""
     async with _get_db().execute(
-        "SELECT session_id, model, created_at, last_used_at, total_cost_usd FROM sessions WHERE chat_id = ?",
-        (chat_id,),
+        "SELECT session_id, model, created_at, last_used_at, total_cost_usd FROM sessions WHERE user_id = ?",
+        (user_id,),
     ) as cursor:
         row = await cursor.fetchone()
         if not row:
@@ -162,6 +174,7 @@ async def get_stats(chat_id: int) -> dict | None:
 
 
 async def create_job(
+    user_id: int,
     chat_id: int,
     name: str,
     job_type: str,
@@ -175,7 +188,8 @@ async def create_job(
     Create a new scheduled job and return its integer ID.
 
     Args:
-        chat_id: Telegram chat ID that owns this job.
+        user_id: Telegram user ID that owns this job.
+        chat_id: Telegram chat ID for message delivery.
         name: Human-readable job name (shown in /jobs).
         job_type: "reminder" (sends prompt as-is) or "claude" (processed by Claude).
         prompt: Message text for reminders, or Claude prompt for Claude jobs.
@@ -192,9 +206,19 @@ async def create_job(
         The auto-generated integer job ID.
     """
     cursor = await _get_db().execute(
-        """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove), int(notify_on_check)),
+        """INSERT INTO jobs (user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            user_id,
+            chat_id,
+            name,
+            job_type,
+            prompt,
+            schedule_type,
+            schedule_data,
+            int(auto_remove),
+            int(notify_on_check),
+        ),
     )
     await _get_db().commit()
     # RuntimeError instead of assert so this guard survives python -O.
@@ -204,11 +228,11 @@ async def create_job(
     return cursor.lastrowid
 
 
-async def get_jobs(chat_id: int) -> list[dict]:
-    """Get all active jobs for a specific chat. Used by /jobs command."""
+async def get_jobs(user_id: int) -> list[dict]:
+    """Get all active jobs for a specific user. Used by /jobs command."""
     async with _get_db().execute(
-        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check, created_at FROM jobs WHERE chat_id = ? AND active = 1",
-        (chat_id,),
+        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check, created_at FROM jobs WHERE user_id = ? AND active = 1",
+        (user_id,),
     ) as cursor:
         rows = await cursor.fetchall()
         # SQLite stores booleans as integers; convert back to bool
@@ -218,12 +242,21 @@ async def get_jobs(chat_id: int) -> list[dict]:
         ]
 
 
-async def get_job_by_id(job_id: int) -> dict | None:
-    """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
-    async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?",
-        (job_id,),
-    ) as cursor:
+async def get_job_by_id(job_id: int, *, user_id: int | None = None) -> dict | None:
+    """Get a single job by ID, or None if not found.
+
+    Args:
+        job_id: Database ID of the job.
+        user_id: If provided, only return the job if it belongs to this user.
+            Internal callers (cron, startup) omit this to access any job.
+    """
+    if user_id is not None:
+        query = "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ? AND user_id = ?"
+        params = (job_id, user_id)
+    else:
+        query = "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?"
+        params = (job_id,)
+    async with _get_db().execute(query, params) as cursor:
         row = await cursor.fetchone()
         if not row:
             return None
@@ -231,9 +264,9 @@ async def get_job_by_id(job_id: int) -> dict | None:
 
 
 async def get_all_active_jobs() -> list[dict]:
-    """Get all active jobs across all chats. Used at startup to register with APScheduler."""
+    """Get all active jobs across all users. Used at startup to register with APScheduler."""
     async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE active = 1"
+        "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
         return [
@@ -242,9 +275,18 @@ async def get_all_active_jobs() -> list[dict]:
         ]
 
 
-async def delete_job(job_id: int) -> bool:
-    """Permanently delete a job. Returns True if a row was deleted, False if not found."""
-    cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+async def delete_job(job_id: int, *, user_id: int | None = None) -> bool:
+    """Permanently delete a job. Returns True if a row was deleted, False if not found.
+
+    Args:
+        job_id: Database ID of the job.
+        user_id: If provided, only delete if the job belongs to this user.
+            Internal callers (cron) omit this to delete any job.
+    """
+    if user_id is not None:
+        cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id))
+    else:
+        cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     await _get_db().commit()
     return cursor.rowcount > 0
 
@@ -258,6 +300,7 @@ async def deactivate_job(job_id: int) -> None:
 async def update_job(
     job_id: int,
     *,
+    user_id: int | None = None,
     name: str | None = None,
     prompt: str | None = None,
     schedule_type: str | None = None,
@@ -272,12 +315,13 @@ async def update_job(
     Returns True if a row was updated, False if the job wasn't found or
     is inactive.
 
-    Note: job_type and chat_id are intentionally not updatable. Changing
-    a job from reminder to claude (or vice versa) is a fundamentally
-    different job — delete and recreate for that.
+    Note: job_type, user_id, and chat_id are intentionally not updatable.
+    Changing a job from reminder to claude (or vice versa) is a fundamentally
+    different job -- delete and recreate for that.
 
     Args:
         job_id: Database ID of the job to update.
+        user_id: If provided, only update if the job belongs to this user.
         name: New job name.
         prompt: New prompt text.
         schedule_type: New schedule type ("once", "daily", "interval").
@@ -315,75 +359,80 @@ async def update_job(
         return False
 
     values.append(job_id)
-    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ? AND active = 1"
+    conditions = "id = ? AND active = 1"
+    if user_id is not None:
+        conditions += " AND user_id = ?"
+        values.append(user_id)
+    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE {conditions}"
     cursor = await _get_db().execute(sql, values)
     await _get_db().commit()
     return cursor.rowcount > 0
 
 
-# ── Settings (generic key-value store) ───────────────────────────────
+# ── Settings (per-user key-value store) ───────────────────────────────
 
 
-async def get_setting(key: str) -> str | None:
+async def get_setting(user_id: int, key: str) -> str | None:
     """
-    Get a setting value by key, or None if not set.
+    Get a setting value by user and key, or None if not set.
 
-    Common keys: "workspace", "voice_mode:{chat_id}", "voice_name:{chat_id}".
+    Common keys: "workspace", "voice_mode", "voice_name".
     """
-    async with _get_db().execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+    async with _get_db().execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)) as cursor:
         row = await cursor.fetchone()
         return row["value"] if row else None
 
 
-async def set_setting(key: str, value: str) -> None:
-    """Set a setting value, creating or updating as needed (upsert)."""
+async def set_setting(user_id: int, key: str, value: str) -> None:
+    """Set a setting value for a user, creating or updating as needed (upsert)."""
     await _get_db().execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
+        "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+        (user_id, key, value),
     )
     await _get_db().commit()
 
 
-async def delete_setting(key: str) -> None:
-    """Remove a setting by key. No-op if the key doesn't exist."""
-    await _get_db().execute("DELETE FROM settings WHERE key = ?", (key,))
+async def delete_setting(user_id: int, key: str) -> None:
+    """Remove a setting by user and key. No-op if the key doesn't exist."""
+    await _get_db().execute("DELETE FROM settings WHERE user_id = ? AND key = ?", (user_id, key))
     await _get_db().commit()
 
 
 # ── Workspace history ────────────────────────────────────────────────
 
 
-async def upsert_workspace_history(path: str) -> None:
-    """Record or refresh a workspace path in the history. Used for /workspaces keyboard."""
+async def upsert_workspace_history(user_id: int, path: str) -> None:
+    """Record or refresh a workspace path in the user's history. Used for /workspaces keyboard."""
     await _get_db().execute(
-        "INSERT INTO workspace_history (path, last_used_at) VALUES (?, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP",
-        (path,),
+        "INSERT INTO workspace_history (user_id, path, last_used_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(user_id, path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP",
+        (user_id, path),
     )
     await _get_db().commit()
 
 
-async def get_workspace_history(limit: int = 10) -> list[dict]:
+async def get_workspace_history(user_id: int, limit: int = 10) -> list[dict]:
     """
-    Get recent workspace paths, ordered by most recently used first.
+    Get recent workspace paths for a user, ordered by most recently used first.
 
     Args:
+        user_id: Telegram user ID.
         limit: Maximum number of entries to return (default 10).
 
     Returns:
         List of dicts with "path" and "last_used_at" keys.
     """
     async with _get_db().execute(
-        "SELECT path, last_used_at FROM workspace_history ORDER BY last_used_at DESC LIMIT ?",
-        (limit,),
+        "SELECT path, last_used_at FROM workspace_history WHERE user_id = ? ORDER BY last_used_at DESC LIMIT ?",
+        (user_id, limit),
     ) as cursor:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
 
-async def delete_workspace_history(path: str) -> None:
-    """Remove a workspace path from history. Used when a workspace directory no longer exists."""
-    await _get_db().execute("DELETE FROM workspace_history WHERE path = ?", (path,))
+async def delete_workspace_history(user_id: int, path: str) -> None:
+    """Remove a workspace path from a user's history. Used when a workspace directory no longer exists."""
+    await _get_db().execute("DELETE FROM workspace_history WHERE user_id = ? AND path = ?", (user_id, path))
     await _get_db().commit()
 
 

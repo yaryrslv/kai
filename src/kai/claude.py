@@ -27,18 +27,20 @@ Context injection on first message of each session:
 
 import asyncio
 import json
-import logging
 import os
+import shutil
 import signal
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from kai.config import WorkspaceConfig, parse_env_file
+import structlog
+
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.claude")
 
 
 # ── Protocol types ───────────────────────────────────────────────────
@@ -114,10 +116,12 @@ class PersistentClaude:
         claude_user: str | None = None,
         max_session_hours: float = 0,
         workspace_config: WorkspaceConfig | None = None,
+        user_id: int | None = None,
     ):
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
+        self.user_id = user_id
         self.webhook_port = webhook_port
         self.webhook_secret = webhook_secret
         self.max_budget_usd = max_budget_usd
@@ -151,6 +155,7 @@ class PersistentClaude:
         self._fresh_session = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
         self._session_started_at: float | None = None  # time.monotonic() at process start
+        self._last_activity: float = time.monotonic()  # For idle eviction
 
     @property
     def is_alive(self) -> bool:
@@ -171,6 +176,11 @@ class PersistentClaude:
     def _should_recycle(self) -> bool:
         """True if the session has exceeded the configured age limit."""
         return self.max_session_hours > 0 and self.is_alive and self._session_age_hours() >= self.max_session_hours
+
+    @property
+    def idle_hours(self) -> float:
+        """Hours since the last message was sent to this instance."""
+        return (time.monotonic() - self._last_activity) / 3600
 
     async def _ensure_started(self) -> None:
         """
@@ -216,9 +226,10 @@ class PersistentClaude:
             cmd = claude_cmd
 
         log.info(
-            "Starting persistent Claude process (model=%s, user=%s)",
-            self.model,
-            self.claude_user or "(same as bot)",
+            "process.started",
+            model=self.model,
+            workspace=str(self.workspace),
+            claude_user=self.claude_user or "(same as bot)",
         )
 
         # Build the subprocess environment. Merge order:
@@ -235,6 +246,9 @@ class PersistentClaude:
         # Webhook secret last - ensures workspace env can't override it.
         if self.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
+        # Inject user ID so inner Claude can include it in API calls
+        if self.user_id is not None:
+            env["KAI_USER_ID"] = str(self.user_id)
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -280,7 +294,7 @@ class PersistentClaude:
                     break
                 text = line.decode().strip()
                 if text:
-                    log.debug("Claude stderr: %s", text[:200])
+                    log.debug("stderr.line", text=text[:200])
             except Exception:
                 log.warning("Unexpected error in stderr drain", exc_info=True)
                 break
@@ -355,6 +369,8 @@ class PersistentClaude:
             StreamEvent objects with accumulated text. The final event has
             done=True and includes the complete ClaudeResponse.
         """
+        self._last_activity = time.monotonic()
+
         # Recycle the session if it has exceeded the age limit. This prevents
         # unbounded memory growth in the inner Claude process (Node.js/V8),
         # which can cause macOS kernel panics via Jetsam on memory-constrained
@@ -362,9 +378,10 @@ class PersistentClaude:
         # during one, so in-flight responses complete normally.
         if self._should_recycle():
             log.info(
-                "Session age %.1f hours exceeds limit of %.1f hours; recycling",
-                self._session_age_hours(),
-                self.max_session_hours,
+                "session.recycled",
+                reason="age",
+                age_hours=round(self._session_age_hours(), 1),
+                limit_hours=self.max_session_hours,
             )
             await self._kill()
 
@@ -411,7 +428,7 @@ class PersistentClaude:
                 parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
             # Inject recent conversation history for continuity
-            recent = get_recent_history()
+            recent = get_recent_history(user_id=self.user_id) if self.user_id is not None else ""
             if recent:
                 parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
 
@@ -422,7 +439,7 @@ class PersistentClaude:
                 api_note = (
                     f"[Scheduling API: To create jobs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/schedule "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f"Required fields: name, prompt, schedule_type, schedule_data. "
                     f"Optional: job_type (reminder|claude), auto_remove (bool). "
                     f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
@@ -443,19 +460,19 @@ class PersistentClaude:
                     f"[Messaging API: To send a text message to the user proactively "
                     f"(e.g., background task results), POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-message "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f'Required: "text" (the message content). '
                     f"Long messages are automatically split at Telegram's 4096-char limit.]"
                 )
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f'Required: "path" (absolute file path within the current workspace {self.workspace}). '
                     f'Optional: "caption". Images are sent as photos, '
                     f"everything else as documents.\n"
                     f"Incoming files from the user are auto-saved to "
-                    f"{self.workspace}/files/ and their paths are included "
+                    f"the user's session directory and their paths are included "
                     f"in the message.]"
                 )
 
@@ -464,7 +481,7 @@ class PersistentClaude:
                 svc_lines = [
                     "[External Services: To call external APIs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/services/{{name}} "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     "Request JSON fields (all optional): "
                     '"body" (dict - forwarded as JSON), '
                     '"params" (dict - query parameters), '
@@ -532,7 +549,7 @@ class PersistentClaude:
             self._proc.stdin.write(msg.encode())
             await self._proc.stdin.drain()
         except OSError as e:
-            log.error("Failed to write to Claude process: %s", e)
+            log.error("process.write_failed", error=str(e))
             await self._kill()
             yield StreamEvent(
                 text_so_far="",
@@ -557,11 +574,7 @@ class PersistentClaude:
                 # Check wall-clock limit before each readline
                 elapsed = time.monotonic() - interaction_start
                 if elapsed > max_interaction_seconds:
-                    log.error(
-                        "Interaction exceeded wall-clock limit (%.0fs > %ds)",
-                        elapsed,
-                        max_interaction_seconds,
-                    )
+                    log.error("process.wall_clock_timeout", elapsed_s=int(elapsed), limit_s=max_interaction_seconds)
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -579,7 +592,7 @@ class PersistentClaude:
                     timeout = self.timeout_seconds * 3
                     line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
                 except TimeoutError:
-                    log.error("Claude response timed out")
+                    log.error("process.readline_timeout")
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -590,7 +603,7 @@ class PersistentClaude:
 
                 if not line:
                     # Process died unexpectedly
-                    log.error("Claude process EOF")
+                    log.error("process.eof")
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -606,7 +619,7 @@ class PersistentClaude:
                 try:
                     event = json.loads(line.decode())
                 except json.JSONDecodeError:
-                    log.debug("Skipping non-JSON stdout line: %s", line.decode().strip()[:200])
+                    log.debug("stdout.non_json", line=line.decode().strip()[:200])
                     continue
 
                 etype = event.get("type")
@@ -631,6 +644,13 @@ class PersistentClaude:
                         duration_ms=event.get("duration_ms", 0),
                         error=event.get("result") if event.get("is_error") else None,
                     )
+                    log.info(
+                        "response.received",
+                        success=response.success,
+                        cost_usd=response.cost_usd,
+                        duration_ms=response.duration_ms,
+                        session_id=response.session_id,
+                    )
                     yield StreamEvent(text_so_far=response.text, done=True, response=response)
                     return
 
@@ -646,7 +666,7 @@ class PersistentClaude:
                                 yield StreamEvent(text_so_far=accumulated_text)
 
         except Exception as e:
-            log.exception("Unexpected error reading Claude stream")
+            log.error("process.error", error=str(e), exc_info=True)
             await self._kill()
             yield StreamEvent(
                 text_so_far=accumulated_text,
@@ -685,7 +705,7 @@ class PersistentClaude:
             try:
                 return self.workspace_config.system_prompt_file.read_text()
             except OSError:
-                log.warning("Cannot read system_prompt_file: %s", self.workspace_config.system_prompt_file)
+                log.warning("system_prompt.read_failed", path=str(self.workspace_config.system_prompt_file))
                 return None
         return None
 
@@ -824,3 +844,113 @@ class PersistentClaude:
                 os.killpg(saved_pgid, signal.SIGKILL)
             except OSError:
                 pass
+
+
+# ── Per-user process pool ──────────────────────────────────────────
+
+
+class ClaudeManager:
+    """Manages per-user PersistentClaude instances with lazy creation."""
+
+    def __init__(self, *, config, services_info: list[dict] | None = None):
+        self._instances: dict[int, PersistentClaude] = {}
+        self._config = config
+        self._services_info = services_info or []
+
+    def get(self, user_id: int) -> PersistentClaude | None:
+        """Get existing instance without creating. Returns None if not found."""
+        return self._instances.get(user_id)
+
+    async def get_or_create(self, user_id: int) -> PersistentClaude:
+        """Get existing instance or create new one for this user."""
+        if user_id not in self._instances:
+            await asyncio.to_thread(self._ensure_user_dirs, user_id)
+            home = self._user_home(user_id)
+            ws_config = self._config.get_workspace_config(home)
+            self._instances[user_id] = PersistentClaude(
+                model=self._config.claude_model,
+                workspace=home,
+                home_workspace=home,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=self._config.webhook_secret,
+                max_budget_usd=self._config.claude_max_budget_usd,
+                timeout_seconds=self._config.claude_timeout_seconds,
+                services_info=self._services_info,
+                claude_user=self._config.claude_user,
+                max_session_hours=self._config.claude_max_session_hours,
+                workspace_config=ws_config,
+                user_id=user_id,
+            )
+        return self._instances[user_id]
+
+    def _ensure_user_dirs(self, user_id: int) -> None:
+        """Create per-user directory structure on first access."""
+        home = self._user_home(user_id)
+        for d in [home, home / ".claude" / "history", home / "files"]:
+            d.mkdir(parents=True, exist_ok=True)
+        # Always overwrite CLAUDE.md from template (deployment-managed, not user-editable)
+        template = self._config.claude_workspace / ".claude" / "CLAUDE.md"
+        target = home / ".claude" / "CLAUDE.md"
+        if template.exists():
+            shutil.copy2(template, target)
+        # Always overwrite .mcp.json from template (deployment-managed)
+        mcp_template = self._config.claude_workspace / ".mcp.json"
+        mcp_target = home / ".mcp.json"
+        if mcp_template.exists():
+            shutil.copy2(mcp_template, mcp_target)
+        # Copy schema_cache.md if not present
+        schema_template = self._config.claude_workspace / "schema_cache.md"
+        schema_target = home / "schema_cache.md"
+        if schema_template.exists() and not schema_target.exists():
+            shutil.copy2(schema_template, schema_target)
+
+    def _user_home(self, user_id: int) -> Path:
+        return DATA_DIR / "users" / str(user_id) / "home"
+
+    async def evict_idle(self, max_idle_hours: float = 4.0) -> int:
+        """Shut down idle instances. Returns count evicted."""
+        to_evict = [
+            uid
+            for uid, inst in self._instances.items()
+            if inst.idle_hours >= max_idle_hours and not inst._lock.locked()
+        ]
+        for uid in to_evict:
+            await self._instances[uid].shutdown()
+            del self._instances[uid]
+        return len(to_evict)
+
+    async def cleanup_old_files(self, max_age_days: int = 7) -> int:
+        """Remove uploaded files older than max_age_days. Returns count removed."""
+        cutoff = time.time() - (max_age_days * 86400)
+        users_dir = DATA_DIR / "users"
+        if not users_dir.exists():
+            return 0
+
+        def _cleanup() -> int:
+            count = 0
+            for user_dir in users_dir.iterdir():
+                files_dir = user_dir / "home" / "files"
+                if not files_dir.is_dir():
+                    continue
+                for f in files_dir.iterdir():
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        count += 1
+            return count
+
+        removed = await asyncio.to_thread(_cleanup)
+        if removed:
+            log.info("files.cleanup", removed=removed, max_age_days=max_age_days)
+        return removed
+
+    async def shutdown_all(self) -> None:
+        """Shut down all Claude instances."""
+        for instance in self._instances.values():
+            await instance.shutdown()
+        self._instances.clear()
+
+    async def shutdown_user(self, user_id: int) -> None:
+        """Shut down a specific user's Claude instance."""
+        if user_id in self._instances:
+            await self._instances[user_id].shutdown()
+            del self._instances[user_id]

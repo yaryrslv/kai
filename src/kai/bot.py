@@ -33,13 +33,13 @@ import asyncio
 import base64
 import functools
 import json
-import logging
 import math
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
+import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -53,10 +53,17 @@ from telegram.ext import (
 )
 
 from kai import services, sessions, webhook
-from kai.claude import PersistentClaude
+from kai.claude import ClaudeManager, PersistentClaude
 from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
+from kai.logging import (
+    audit_assistant_response,
+    audit_auth_event,
+    audit_user_message,
+    log_handler,
+    reset_session_id,
+)
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
@@ -81,36 +88,42 @@ except ImportError:
         return 0
 
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.bot")
 
 # Minimum interval between Telegram message edits (seconds).
 # Telegram rate-limits message edits; 2 seconds keeps us safely below the limit
 # while still giving the user a sense of streaming output.
 EDIT_INTERVAL = 2.0
 
-# Flag file written while processing a message. If the process crashes mid-response,
-# main.py detects this file at startup and notifies the user to resend. Lives under
-# DATA_DIR so it's writable even when source is in read-only /opt/kai/.
-_RESPONDING_FLAG = DATA_DIR / ".responding_to"
+# ── Crash recovery flag (per-user) ───────────────────────────────────
 
 
-# ── Crash recovery flag ──────────────────────────────────────────────
+async def _set_responding(user_id: int, chat_id: int) -> None:
+    """Write the chat ID to a per-user flag file, marking a response as in-flight."""
+    flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
+
+    def _write() -> None:
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(str(chat_id))
+
+    await asyncio.to_thread(_write)
 
 
-def _set_responding(chat_id: int) -> None:
-    """Write the chat ID to the flag file, marking a response as in-flight."""
-    _RESPONDING_FLAG.write_text(str(chat_id))
+async def _clear_responding(user_id: int) -> None:
+    """Remove the per-user flag file, indicating the response completed (or failed gracefully)."""
+    flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
+    await asyncio.to_thread(flag.unlink, True)
 
 
-def _clear_responding() -> None:
-    """Remove the flag file, indicating the response completed (or failed gracefully)."""
-    _RESPONDING_FLAG.unlink(missing_ok=True)
+def _user_home(user_id: int) -> Path:
+    """Return the per-user home workspace path."""
+    return DATA_DIR / "users" / str(user_id) / "home"
 
 
-async def _notify_if_queued(update: Update, chat_id: int) -> bool:
+async def _notify_if_queued(update: Update, user_id: int) -> bool:
     """Send a notification if the user's message will queue behind the lock.
 
-    Called immediately before acquiring the per-chat lock. If the lock is
+    Called immediately before acquiring the per-user lock. If the lock is
     already held (Kai is mid-response), sends a one-line Telegram message
     so the user knows their message was received. The notification goes
     directly to Telegram via _reply_safe - Claude never sees it. Do NOT
@@ -126,7 +139,7 @@ async def _notify_if_queued(update: Update, chat_id: int) -> bool:
     context-switch marker for a task that already finished. Both are
     harmless and not worth fixing.
     """
-    if get_lock(chat_id).locked():
+    if get_lock(user_id).locked():
         assert update.message is not None
         await _reply_safe(
             update.message,
@@ -155,11 +168,11 @@ _LOCK_ACQUIRE_TIMEOUT = 660  # 11 minutes
 
 
 async def _acquire_lock_or_kill(
-    chat_id: int,
+    user_id: int,
     claude: "PersistentClaude",
     update: Update,
 ) -> asyncio.Lock | None:
-    """Acquire the per-chat lock with a timeout, force-killing if stuck.
+    """Acquire the per-user lock with a timeout, force-killing if stuck.
 
     Returns the acquired lock on success (caller must call lock.release()
     in a finally block). Returns None if the lock timed out, in which case
@@ -170,16 +183,12 @@ async def _acquire_lock_or_kill(
     releases the same object that was acquired (avoids issues if get_lock
     is called again and returns a different instance).
     """
-    lock = get_lock(chat_id)
+    lock = get_lock(user_id)
     try:
         await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
         return lock
     except TimeoutError:
-        log.error(
-            "Lock acquisition timed out for chat %d after %ds; force-killing Claude",
-            chat_id,
-            _LOCK_ACQUIRE_TIMEOUT,
-        )
+        log.error("lock.timeout", user_id=user_id, timeout_seconds=_LOCK_ACQUIRE_TIMEOUT)
         claude.force_kill()
         # update.message can be None for edited messages or callback
         # queries, so guard rather than assert.
@@ -230,6 +239,10 @@ def _is_authorized(config: Config, user_id: int) -> bool:
     return user_id in config.allowed_user_ids
 
 
+# NOTE: @_require_auth is always the OUTERMOST decorator on handlers.
+# This means unauthorized requests are silently dropped BEFORE @log_handler
+# runs — intentional: we don't log or acknowledge unauthorized access to
+# avoid revealing the bot's existence during probing.
 def _require_auth(func):
     """
     Decorator that silently drops updates from unauthorized users.
@@ -293,9 +306,9 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
         except Exception:
             # Editing is best-effort during streaming; log at debug so persistent
             # issues (e.g., revoked bot token) leave a diagnostic trail
-            log.debug("Failed to edit message (plain-text fallback)", exc_info=True)
+            log.debug("message.edit_failed", fallback="plain_text", exc_info=True)
     except Exception:
-        log.debug("Failed to edit message", exc_info=True)
+        log.debug("message.edit_failed", exc_info=True)
 
 
 def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
@@ -336,15 +349,17 @@ async def _send_response(update: Update, text: str) -> None:
         await _reply_safe(update.message, chunk)
 
 
-def _get_claude(context: ContextTypes.DEFAULT_TYPE) -> PersistentClaude:
-    """Retrieve the PersistentClaude instance from bot_data."""
-    return context.bot_data["claude"]
+async def _get_claude(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> PersistentClaude:
+    """Retrieve the PersistentClaude instance for a user via ClaudeManager."""
+    manager: ClaudeManager = context.bot_data["claude_manager"]
+    return await manager.get_or_create(user_id)
 
 
 # ── Basic command handlers ───────────────────────────────────────────
 
 
 @_require_auth
+@log_handler("start")
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start — the initial greeting when a user first messages the bot."""
     assert update.message is not None
@@ -352,6 +367,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("new_session")
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /new — kill the Claude process and start a fresh session.
@@ -360,9 +376,11 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     kills the subprocess so the next message launches a new one.
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    claude = await _get_claude(context, user_id)
     await claude.restart()
-    await sessions.clear_session(_chat_id(update))
+    await sessions.clear_session(user_id)
+    reset_session_id(user_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -388,28 +406,30 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 
 
 @_require_auth
+@log_handler("list_models")
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
     assert update.message is not None
-    claude = _get_claude(context)
+    claude = await _get_claude(context, _user_id(update))
     await update.message.reply_text(
         "Choose a model:",
         reply_markup=_models_keyboard(claude.model),
     )
 
 
-async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model: str) -> None:
+async def _switch_model(context: ContextTypes.DEFAULT_TYPE, user_id: int, model: str) -> None:
     """
     Switch the Claude model, restart the process, and clear the session.
 
     Called by both the inline keyboard callback and the /model text command.
     """
-    claude = _get_claude(context)
+    claude = await _get_claude(context, user_id)
     claude.model = model
     await claude.restart()
-    await sessions.clear_session(chat_id)
+    await sessions.clear_session(user_id)
 
 
+@log_handler("select_model")
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard model selection.
@@ -430,14 +450,14 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid model.")
         return
 
-    claude = _get_claude(context)
+    claude = await _get_claude(context, _user_id(update))
     if model == claude.model:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
     await query.answer()
-    await _switch_model(context, _chat_id(update), model)
+    await _switch_model(context, _user_id(update), model)
     await query.edit_message_text(
         f"Switched to {_AVAILABLE_MODELS[model]}. Session restarted.",
         reply_markup=InlineKeyboardMarkup([]),
@@ -445,6 +465,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @_require_auth
+@log_handler("switch_model")
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /model <name> — switch model directly via text command."""
     assert update.message is not None
@@ -455,7 +476,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if model not in _AVAILABLE_MODELS:
         await update.message.reply_text("Choose: opus, sonnet, or haiku")
         return
-    await _switch_model(context, _chat_id(update), model)
+    await _switch_model(context, _user_id(update), model)
     await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
 
 
@@ -477,6 +498,7 @@ _VOICE_MODE_LABELS = {"off": "OFF", "on": "ON (text + voice)", "only": "ONLY (vo
 
 
 @_require_auth
+@log_handler("voice_toggle")
 async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /voice — toggle voice mode or set a specific voice.
@@ -494,21 +516,21 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
 
     if context.args:
         arg = context.args[0].lower()
         if arg in _VOICE_MODES:
             # /voice on|only|off — set mode directly
-            await sessions.set_setting(f"voice_mode:{chat_id}", arg)
+            await sessions.set_setting(user_id, "voice_mode", arg)
             await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})")
         elif arg in VOICES:
             # /voice <name> — set voice (enable in current mode, or default to "only")
-            await sessions.set_setting(f"voice_name:{chat_id}", arg)
+            await sessions.set_setting(user_id, "voice_name", arg)
             if current_mode == "off":
-                await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+                await sessions.set_setting(user_id, "voice_mode", "only")
                 current_mode = "only"
             await update.message.reply_text(
                 f"Voice set to {VOICES[arg]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}"
@@ -526,11 +548,12 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         # /voice — toggle: off → only → off
         new_mode = "off" if current_mode != "off" else "only"
-        await sessions.set_setting(f"voice_mode:{chat_id}", new_mode)
+        await sessions.set_setting(user_id, "voice_mode", new_mode)
         await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})")
 
 
 @_require_auth
+@log_handler("list_voices")
 async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /voices — show an inline keyboard of available TTS voices."""
     assert update.message is not None
@@ -539,14 +562,15 @@ async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
     await update.message.reply_text(
         "Choose a voice:",
         reply_markup=_voices_keyboard(current_voice),
     )
 
 
+@log_handler("select_voice")
 async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard voice selection.
@@ -567,19 +591,19 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid voice.")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
 
     if voice == current_voice:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    await sessions.set_setting(f"voice_name:{chat_id}", voice)
+    current_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
+    await sessions.set_setting(user_id, "voice_name", voice)
     # Auto-enable voice if it was off
     if current_mode == "off":
-        await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+        await sessions.set_setting(user_id, "voice_mode", "only")
         current_mode = "only"
     await query.answer()
     await query.edit_message_text(
@@ -592,11 +616,13 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @_require_auth
+@log_handler("stats")
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
-    claude = _get_claude(context)
-    stats = await sessions.get_stats(_chat_id(update))
+    user_id = _user_id(update)
+    claude = await _get_claude(context, user_id)
+    stats = await sessions.get_stats(user_id)
     alive = claude.is_alive
     if not stats:
         await update.message.reply_text(f"No active session.\nProcess alive: {alive}")
@@ -612,6 +638,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("list_jobs")
 async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /jobs — list all active scheduled jobs with their schedules.
@@ -620,7 +647,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     jobs), the job ID, name, and a human-readable schedule description.
     """
     assert update.message is not None
-    jobs = await sessions.get_jobs(_chat_id(update))
+    jobs = await sessions.get_jobs(_user_id(update))
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -652,6 +679,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @_require_auth
+@log_handler("cancel_job")
 async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /canceljob <id> — permanently delete a scheduled job.
@@ -667,7 +695,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("Job ID must be a number.")
         return
-    deleted = await sessions.delete_job(job_id)
+    deleted = await sessions.delete_job(job_id, user_id=_user_id(update))
     if not deleted:
         await update.message.reply_text(f"Job #{job_id} not found.")
         return
@@ -684,6 +712,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @_require_auth
+@log_handler("stop")
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /stop — abort the current Claude response.
@@ -693,11 +722,13 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sees the stop event and appends "(stopped)" to the live message.
     """
     assert update.message is not None
-    chat_id = _chat_id(update)
-    claude = _get_claude(context)
-    stop_event = get_stop_event(chat_id)
+    user_id = _user_id(update)
+    manager: ClaudeManager = context.bot_data["claude_manager"]
+    stop_event = get_stop_event(user_id)
     stop_event.set()
-    claude.force_kill()
+    claude = manager.get(user_id)
+    if claude:
+        claude.force_kill()
     await update.message.reply_text("Stopping...")
 
 
@@ -783,7 +814,7 @@ def _workspace_config_suffix(ws_config: WorkspaceConfig | None) -> str:
     return f" ({', '.join(extras)})" if extras else ""
 
 
-async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> WorkspaceConfig | None:
+async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, user_id: int, path: Path) -> WorkspaceConfig | None:
     """
     Core workspace switch logic shared by command and callback handlers.
 
@@ -795,23 +826,24 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     Returns the WorkspaceConfig for the target workspace (or None) so
     callers can display config details without a redundant lookup.
     """
-    claude = _get_claude(context)
-    config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    claude = await _get_claude(context, user_id)
+    home = _user_home(user_id)
 
     # Look up per-workspace config for the target workspace.
+    config: Config = context.bot_data["config"]
     ws_config = config.get_workspace_config(path)
     await claude.change_workspace(path, workspace_config=ws_config)
     # Keep the webhook server's confinement path in sync so send-file accepts
     # files from the new workspace rather than rejecting them with 403.
-    webhook.update_workspace(str(path))
-    await sessions.clear_session(chat_id)
+    webhook.update_workspace(user_id, str(path))
+    await sessions.clear_session(user_id)
+    reset_session_id(user_id)
 
     if path == home:
-        await sessions.delete_setting("workspace")
+        await sessions.delete_setting(user_id, "workspace")
     else:
-        await sessions.set_setting("workspace", str(path))
-        await sessions.upsert_workspace_history(str(path))
+        await sessions.set_setting(user_id, "workspace", str(path))
+        await sessions.upsert_workspace_history(user_id, str(path))
 
     return ws_config
 
@@ -824,9 +856,9 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     metadata (git repo detection, CLAUDE.md presence).
     """
     assert update.message is not None
-    claude = _get_claude(context)
-    config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    user_id = _user_id(update)
+    claude = await _get_claude(context, user_id)
+    home = _user_home(user_id)
 
     if path == claude.workspace:
         await update.message.reply_text("Already in that workspace.")
@@ -837,7 +869,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("That workspace no longer exists.")
         return
 
-    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, user_id, path)
 
     config_suffix = _workspace_config_suffix(ws_config)
 
@@ -919,14 +951,16 @@ async def _workspaces_keyboard(
 
 
 @_require_auth
+@log_handler("list_workspaces")
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /workspaces — show an inline keyboard of recent workspaces."""
     assert update.message is not None
-    history = await sessions.get_workspace_history()
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    history = await sessions.get_workspace_history(user_id)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
-    home = str(config.claude_workspace)
+    home = str(_user_home(user_id))
 
     if not history and not config.allowed_workspaces and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
@@ -936,6 +970,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
+@log_handler("select_workspace")
 async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard workspace selection.
@@ -953,8 +988,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     assert query.data is not None
     data = query.data.removeprefix("ws:")
-    claude = _get_claude(context)
-    home = config.claude_workspace
+    user_id = _user_id(update)
+    claude = await _get_claude(context, user_id)
+    home = _user_home(user_id)
     base = config.workspace_base
 
     # Resolve target path from callback data
@@ -987,7 +1023,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.answer("Invalid selection.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
-        history = await sessions.get_workspace_history()
+        history = await sessions.get_workspace_history(user_id)
         if idx < 0 or idx >= len(history):
             await query.answer("Workspace no longer in history.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
@@ -997,9 +1033,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         # This handles the case where a path was removed from ALLOWED_WORKSPACES
         # after the user visited it — the history entry persists but access is revoked.
         if not _is_workspace_allowed(path, config):
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(user_id, str(path))
             await query.answer("That workspace is no longer allowed.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(user_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1007,9 +1043,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             return
         # Remove stale entries where the directory no longer exists
         if not path.is_dir():
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(user_id, str(path))
             await query.answer("That workspace no longer exists.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(user_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1025,7 +1061,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     # Switch and confirm, showing any per-workspace config details
     await query.answer()
-    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, user_id, path)
     suffix = _workspace_config_suffix(ws_config)
     await query.edit_message_text(
         f"Switched to {label}{suffix}. Session cleared.",
@@ -1037,6 +1073,7 @@ _NO_BASE_MSG = "WORKSPACE_BASE is not set. Add it to .env and restart."
 
 
 @_require_auth
+@log_handler("switch_workspace")
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /workspace — show, switch, or create workspaces.
@@ -1051,9 +1088,10 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    home = _user_home(user_id)
     base = config.workspace_base
 
     # No args: show current workspace
@@ -1139,6 +1177,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @_require_auth
+@log_handler("webhooks")
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /webhooks — show webhook server status and endpoint info."""
     assert update.message is not None
@@ -1179,6 +1218,7 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @_require_auth
+@log_handler("help")
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help — show all available commands."""
     assert update.message is not None
@@ -1200,12 +1240,53 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
+        "/notifications - Toggle webhook/GitHub notifications\n"
         "/webhooks - Show webhook server status\n"
         "/help - This message"
     )
 
 
 @_require_auth
+@log_handler("notifications")
+async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /notifications — toggle GitHub/webhook notification preferences."""
+    assert update.message is not None
+    user_id = _user_id(update)
+
+    if not context.args:
+        gh = await sessions.get_setting(user_id, "github_notifications") or "true"
+        wh = await sessions.get_setting(user_id, "webhook_notifications") or "true"
+        on_off = {"true": "on", "false": "off"}
+        await update.message.reply_text(
+            f"Notification settings:\n"
+            f"  GitHub: {on_off[gh]}\n"
+            f"  Webhooks: {on_off[wh]}\n\n"
+            f"Usage:\n"
+            f"  /notifications github off\n"
+            f"  /notifications webhook on"
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /notifications <github|webhook> <on|off>")
+        return
+
+    source = context.args[0].lower()
+    state = context.args[1].lower()
+
+    if source not in ("github", "webhook") or state not in ("on", "off"):
+        await update.message.reply_text("Usage: /notifications <github|webhook> <on|off>")
+        return
+
+    key = f"{source}_notifications"
+    value = "true" if state == "on" else "false"
+    await sessions.set_setting(user_id, key, value)
+    display = {"github": "GitHub", "webhook": "Webhook"}
+    await update.message.reply_text(f"{display[source]} notifications: {state}")
+
+
+@_require_auth
+@log_handler("unknown_command")
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unrecognized slash commands with a helpful redirect to /help."""
     assert update.message is not None
@@ -1217,25 +1298,24 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
+def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
     """
-    Save file bytes to the workspace/files/ directory with a timestamped name.
+    Save file bytes to the user's home/files/ directory with a timestamped name.
 
-    Creates the files/ directory if it doesn't exist. Filenames are prefixed
-    with a timestamp to avoid collisions and sanitized to remove slashes and
-    spaces. Returns the absolute path to the saved file so Claude can
-    reference it in subsequent commands.
+    Files are stored in DATA_DIR/users/{user_id}/home/files/ — a user-level
+    directory that persists across sessions, ensuring Claude always has access
+    to uploaded files regardless of session resets or workspace switches.
 
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
-        workspace: The current workspace root directory.
+        user_id: Telegram user ID for per-user isolation.
 
     Returns:
         Absolute path to the saved file.
     """
-    files_dir = workspace / "files"
-    files_dir.mkdir(exist_ok=True)
+    files_dir = DATA_DIR / "users" / str(user_id) / "home" / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1246,6 +1326,7 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
 
 
 @_require_auth
+@log_handler("photo")
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle photo messages — download, base64-encode, and send to Claude.
@@ -1257,8 +1338,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.photo:
         return
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
     # Download the largest available resolution (last in the list)
@@ -1268,34 +1350,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = bytes(data)
     b64 = base64.b64encode(raw).decode()
 
-    # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace)
+    saved = _save_to_user_files(raw, f"photo_{photo.file_unique_id}.jpg", user_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
-    log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
+    # log_message → JSONL conversation history; audit_* → structured audit log (separate stores)
+    await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
+    audit_user_message(user_id, chat_id, caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
     ]
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1363,6 +1447,7 @@ _IMAGE_MEDIA_TYPES = {
 
 
 @_require_auth
+@log_handler("document")
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle document (file) uploads -- images, text files, and everything else.
@@ -1381,8 +1466,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     suffix = Path(file_name).suffix.lower()
     caption = update.message.caption or ""
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
     if suffix in _IMAGE_MEDIA_TYPES:
@@ -1393,17 +1479,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        # Save to per-user files directory so Claude can access the file
+        saved = _save_to_user_files(raw, file_name, user_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
-        log_message(
+        await log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or file_name,
             media={"type": "document", "filename": file_name},
         )
+        audit_user_message(user_id, chat_id, caption or file_name, media={"type": "document", "filename": file_name})
         content = [
             {"type": "text", "text": img_caption},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
@@ -1419,15 +1507,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        # Save to per-user files directory so Claude can access the file
+        saved = _save_to_user_files(raw, file_name, user_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
-        log_message(
+        await log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
+        )
+        audit_user_message(
+            user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name}
         )
         if caption:
             content = f"{caption}\n\n{header}"
@@ -1438,38 +1530,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, claude.workspace)
+        saved = _save_to_user_files(bytes(data), file_name, user_id)
 
-        log_message(
+        await log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
+        audit_user_message(
+            user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name}
+        )
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
 
 @_require_auth
+@log_handler("voice")
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle voice messages — transcribe via whisper-cpp and send to Claude.
@@ -1483,8 +1581,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.voice:
         return
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
 
     if not config.voice_enabled:
@@ -1510,11 +1609,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     audio_data = bytes(await file.download_as_bytearray())
 
-    log_message(
+    await log_message(
         direction="user",
+        user_id=user_id,
         chat_id=chat_id,
         text=f"[voice message, {voice.duration}s]",
         media={"type": "voice", "duration": voice.duration},
+    )
+    audit_user_message(
+        user_id, chat_id, f"[voice message, {voice.duration}s]", media={"type": "voice", "duration": voice.duration}
     )
 
     try:
@@ -1533,23 +1636,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     prompt = f"[Voice message transcription]: {transcript}"
     model = claude.model
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1558,6 +1662,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("message")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle plain text messages — the primary interaction path.
@@ -1599,6 +1704,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context.user_data["totp_pending"] = {
                     "expires_at": time.time() + challenge_sec,
                 }
+                audit_auth_event(_user_id(update), "challenge_sent")
                 await update.message.reply_text("Session expired. Enter code from authenticator.")
                 return
 
@@ -1632,6 +1738,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if verify_code(code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
                 context.user_data["totp_authenticated_at"] = time.time()
+                audit_auth_event(_user_id(update), "verified")
                 await update.effective_chat.send_message("Authenticated.")
                 # Return here - the code message has been deleted and its text
                 # is meaningless as a Claude prompt. The user sends their actual
@@ -1642,11 +1749,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lockout_remaining = get_lockout_remaining()
             if lockout_remaining > 0:
                 del context.user_data["totp_pending"]
+                audit_auth_event(_user_id(update), "lockout", minutes=lockout_minutes)
                 await update.effective_chat.send_message(
                     f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
                 )
             else:
                 remaining = lockout_attempts - get_failure_count()
+                audit_auth_event(_user_id(update), "failed", remaining=remaining)
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
 
@@ -1655,29 +1764,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["totp_authenticated_at"] = time.time()
     # ── End TOTP gate ─────────────────────────────────────────────────────
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
     prompt = update.message.text
-    log_message(direction="user", chat_id=chat_id, text=prompt)
-    claude = _get_claude(context)
+    await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
+    audit_user_message(user_id, chat_id, prompt)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1688,6 +1800,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _handle_response(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
     chat_id: int,
     prompt: str | list,
     claude: PersistentClaude,
@@ -1702,7 +1815,7 @@ async def _handle_response(
     1. Check voice mode to determine output format
     2. Start a background typing indicator task
     3. Stream events from Claude, creating/editing a live Telegram message
-    4. Handle /stop interruptions via the per-chat stop event
+    4. Handle /stop interruptions via the per-user stop event
     5. On completion: save session, log response, deliver final text/voice
     6. Handle errors gracefully with user-visible error messages
 
@@ -1715,6 +1828,7 @@ async def _handle_response(
     Args:
         update: The Telegram Update that triggered this response.
         context: Telegram callback context.
+        user_id: The Telegram user ID.
         chat_id: The Telegram chat ID.
         prompt: Text string or list of content blocks to send to Claude.
         claude: The PersistentClaude instance.
@@ -1725,7 +1839,7 @@ async def _handle_response(
     config: Config = context.bot_data["config"]
     voice_mode = "off"
     if config.tts_enabled:
-        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+        voice_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
     voice_only = voice_mode == "only"
 
     # Keep activity indicator visible until the response completes.
@@ -1754,7 +1868,7 @@ async def _handle_response(
 
     try:
         # Reset the stop event (in case /stop was sent between messages)
-        stop_event = get_stop_event(chat_id)
+        stop_event = get_stop_event(user_id)
         stop_event.clear()
 
         # Stream events from Claude
@@ -1808,15 +1922,17 @@ async def _handle_response(
     # try to address it instead of the current message.
     if final_response is None:
         if stopped_by_user:
-            log_message(direction="assistant", chat_id=chat_id, text="[stopped by user]")
+            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[stopped by user]")
         else:
-            log_message(direction="assistant", chat_id=chat_id, text="[no response]")
+            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[no response]")
             await update.message.reply_text("Error: No response from Claude")
         return
 
     if not final_response.success:
         error_text = f"Error: {final_response.error}"
-        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {final_response.error}]")
+        await log_message(
+            direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]"
+        )
         if live_msg:
             await _edit_message_safe(live_msg, error_text)
         else:
@@ -1825,20 +1941,29 @@ async def _handle_response(
 
     # Persist session info for /stats (cost accumulates across interactions)
     if final_response.session_id:
-        await sessions.save_session(chat_id, final_response.session_id, model, final_response.cost_usd)
+        await sessions.save_session(user_id, chat_id, final_response.session_id, model, final_response.cost_usd)
 
     final_text = final_response.text
-    log_message(direction="assistant", chat_id=chat_id, text=final_text)
+    await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=final_text)
+    audit_assistant_response(
+        user_id,
+        chat_id,
+        final_text,
+        cost_usd=final_response.cost_usd,
+        duration_ms=final_response.duration_ms,
+        model=model,
+        session_id=final_response.session_id,
+    )
 
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        voice_name = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
             return
         except TTSError as e:
-            log.warning("TTS failed, falling back to text: %s", e)
+            log.warning("tts.failed", error=str(e), fallback="text")
 
     # Send text response (normal mode, or voice-only fallback)
     if live_msg:
@@ -1857,12 +1982,12 @@ async def _handle_response(
 
     # Text+voice mode: send voice note after text
     if voice_mode == "on" and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        voice_name = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
         except TTSError as e:
-            log.warning("TTS failed: %s", e)
+            log.warning("tts.failed", error=str(e))
 
 
 # ── Application factory ─────────────────────────────────────────────
@@ -1900,21 +2025,9 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
-    # Apply per-workspace config for the startup workspace (if any).
-    initial_ws_config = config.get_workspace_config(config.claude_workspace)
-
-    app.bot_data["claude"] = PersistentClaude(
-        model=config.claude_model,
-        workspace=config.claude_workspace,
-        home_workspace=config.claude_workspace,
-        webhook_port=config.webhook_port,
-        webhook_secret=config.webhook_secret,
-        max_budget_usd=config.claude_max_budget_usd,
-        timeout_seconds=config.claude_timeout_seconds,
+    app.bot_data["claude_manager"] = ClaudeManager(
+        config=config,
         services_info=services.get_available_services(),
-        claude_user=config.claude_user,
-        max_session_hours=config.claude_max_session_hours,
-        workspace_config=initial_ws_config,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)
@@ -1931,6 +2044,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("voice", handle_voice_command))
     app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
+    app.add_handler(CommandHandler("notifications", handle_notifications))
     app.add_handler(CommandHandler("stop", handle_stop))
 
     # Callback query handlers for inline keyboards (pattern-matched)

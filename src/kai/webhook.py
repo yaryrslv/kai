@@ -42,18 +42,19 @@ import functools
 import hashlib
 import hmac
 import json
-import logging
 import re
 import time
 from pathlib import Path
 
+import structlog
 from aiohttp import web
 from telegram import Update
 
 from kai import cron, review, services, sessions, triage
-from kai.config import IMAGE_EXTENSIONS
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS
+from kai.logging import audit_service_call, audit_webhook_event, log_route
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.webhook")
 
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
@@ -87,6 +88,9 @@ _ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
 # In-memory cooldown dict: (repo_full_name, pr_number) -> last_review_timestamp.
 # Resets on restart, which is acceptable - worst case is one extra review
 # after a restart. No database table needed for stateless reviews.
+# Multi-user note: Cooldowns are intentionally keyed by (repo, number) without
+# user_id. Reviewing the same PR twice within the cooldown window wastes API
+# budget regardless of which user triggered it — the reviews would be identical.
 _review_cooldowns: dict[tuple[str, int], float] = {}
 
 
@@ -128,6 +132,8 @@ def _record_review(repo: str, pr_number: int) -> None:
 # In-memory cooldown dict: (repo_full_name, issue_number) -> last_triage_timestamp.
 # Prevents duplicate triage if GitHub sends multiple webhook deliveries
 # for the same event (retries, duplicate deliveries). 60-second cooldown.
+# Multi-user note: Same cross-user cooldown rationale as _review_cooldowns above.
+# Triaging the same issue twice wastes API budget with identical results.
 _triage_cooldowns: dict[tuple[str, int], float] = {}
 
 # Fixed cooldown for triage - much shorter than PR review (300s) because
@@ -176,10 +182,9 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     Matches the repo part of the full name (e.g., "kai" from "dcellison/kai")
     against known workspace locations. Checks in priority order:
 
-    1. Home workspace (derived from app["workspace"] parent)
+    1. User workspaces (derived from per-user workspace paths)
     2. WORKSPACE_BASE children
     3. ALLOWED_WORKSPACES entries
-    4. workspace_history entries from the database
 
     Args:
         repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
@@ -191,14 +196,18 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     # Extract just the repo name from "owner/repo"
     repo_name = repo_full_name.split("/")[-1]
 
-    # 1. Home workspace - the workspace parent is the repo root.
-    # app["workspace"] is the workspace subdirectory (e.g., /opt/kai/workspace),
+    # NOTE: Step 1 iterates ALL users' workspaces. This is intentional --
+    # repo resolution finds a local checkout for spec/convention loading,
+    # and any user's workspace pointing to the repo is equally valid.
+
+    # 1. User workspaces - check all active per-user workspace paths.
+    # Each workspace may be a subdirectory of the repo root (e.g., /opt/kai/workspace),
     # so .parent gives the repo root (e.g., /opt/kai/).
-    workspace = app.get("workspace")
-    if workspace:
-        home_path = Path(workspace).parent
-        if home_path.name == repo_name and home_path.is_dir():
-            return str(home_path)
+    for ws_path in (app.get("user_workspaces") or {}).values():
+        if ws_path:
+            home_path = Path(ws_path).parent
+            if home_path.name == repo_name and home_path.is_dir():
+                return str(home_path)
 
     # 2. WORKSPACE_BASE - scan immediate children for matching dir name
     workspace_base = app.get("workspace_base")
@@ -212,14 +221,22 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
         if Path(allowed).name == repo_name and Path(allowed).is_dir():
             return str(allowed)
 
-    # 4. workspace_history - check each entry's directory name
-    history = await sessions.get_workspace_history(limit=50)
-    for entry in history:
-        path = Path(entry["path"])
-        if path.name == repo_name and path.is_dir():
-            return str(path)
-
     return None
+
+
+def _users_for_repo(repo_full_name: str, app: web.Application) -> list[int]:
+    """Determine which users should receive notifications for a GitHub repo.
+
+    Matches the repo name against active per-user workspace paths. Returns an
+    empty list if no workspace matches — unmatched repos produce no notifications
+    to avoid spamming users with events from repos they don't work on.
+    """
+    repo_name = repo_full_name.split("/")[-1]
+    matched: list[int] = []
+    for uid, ws_path in (app.get("user_workspaces") or {}).items():
+        if (ws_path and Path(ws_path).name == repo_name) or (ws_path and Path(ws_path).parent.name == repo_name):
+            matched.append(uid)
+    return matched
 
 
 def _strip_markdown(text: str) -> str:
@@ -252,7 +269,7 @@ def _require_secret(handler):
         secret = request.app["webhook_secret"]
         provided = request.headers.get("X-Webhook-Secret", "")
         if not hmac.compare_digest(provided, secret):
-            log.warning("Auth failure on %s from %s", request.path, request.remote)
+            log.warning("auth.failed", path=request.path, remote=request.remote)
             return web.Response(status=401, text="Invalid secret")
         return await handler(request)
 
@@ -387,11 +404,13 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 # ── Route handlers ───────────────────────────────────────────────────
 
 
+@log_route("health")
 async def _handle_health(request: web.Request) -> web.Response:
     """Health check endpoint. Returns {"status": "ok"} for uptime monitoring."""
     return web.json_response({"status": "ok"})
 
 
+@log_route("telegram_webhook")
 async def _handle_telegram_update(request: web.Request) -> web.Response:
     """
     Receive a Telegram update pushed via webhook.
@@ -442,6 +461,7 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     return web.Response(status=200)
 
 
+@log_route("github_webhook")
 async def _handle_github(request: web.Request) -> web.Response:
     """
     Handle incoming GitHub webhook events.
@@ -455,7 +475,6 @@ async def _handle_github(request: web.Request) -> web.Response:
     """
     secret = request.app["webhook_secret"]
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
 
     body = await request.read()
 
@@ -476,49 +495,52 @@ async def _handle_github(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
+    repo = payload.get("repository", {}).get("full_name", "")
+    action = payload.get("action", "")
+    audit_webhook_event("github", source=request.remote, webhook_event=event_type, repo=repo, action=action)
+
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled, reviewable PR events (opened, reopened,
     # synchronize) are routed to the review pipeline instead of the
     # notification formatter. Non-reviewable actions (closed, merged)
     # still get the standard Telegram notification.
     pr_review_enabled = request.app.get("pr_review_enabled", False)
-    if pr_review_enabled and event_type == "pull_request":
-        action = payload.get("action", "")
-        if action in ("opened", "reopened", "synchronize"):
-            pr = payload.get("pull_request", {})
-            pr_number = pr.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
-            cooldown = request.app.get("pr_review_cooldown", 300)
+    if pr_review_enabled and event_type == "pull_request" and action in ("opened", "reopened", "synchronize"):
+        pr = payload.get("pull_request", {})
+        pr_number = pr.get("number", 0)
+        cooldown = request.app.get("pr_review_cooldown", 300)
 
-            if _should_skip_review(repo, pr_number, cooldown):
-                log.info("Skipping review of %s PR #%d (cooldown)", repo, pr_number)
-                return web.json_response({"msg": "review_cooldown"})
+        if _should_skip_review(repo, pr_number, cooldown):
+            log.info("review.cooldown", repo=repo, pr_number=pr_number)
+            return web.json_response({"msg": "review_cooldown"})
 
-            _record_review(repo, pr_number)
+        _record_review(repo, pr_number)
 
-            # Resolve a local repo path for spec/convention loading.
-            # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
-            # and workspace history for a directory matching the repo name.
-            local_repo_path = await _resolve_local_repo(repo, request.app)
+        # Resolve a local repo path for spec/convention loading.
+        # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
+        # and workspace history for a directory matching the repo name.
+        local_repo_path = await _resolve_local_repo(repo, request.app)
+        target_users = _users_for_repo(repo, request.app)
 
-            # Launch the review as a fire-and-forget background task.
-            # Same pattern as Telegram update processing: create_task +
-            # _background_tasks set to prevent GC during execution.
-            task = asyncio.create_task(
-                review.review_pr(
-                    payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
-                    claude_user=request.app.get("claude_user"),
-                    local_repo_path=local_repo_path,
-                    spec_dir=request.app.get("spec_dir", "specs"),
-                )
+        # Launch the review as a fire-and-forget background task.
+        # Same pattern as Telegram update processing: create_task +
+        # _background_tasks set to prevent GC during execution.
+        task = asyncio.create_task(
+            review.review_pr(
+                payload,
+                webhook_port=request.app["webhook_port"],
+                webhook_secret=request.app["webhook_secret"],
+                claude_user=request.app.get("claude_user"),
+                local_repo_path=local_repo_path,
+                spec_dir=request.app.get("spec_dir", "specs"),
+                user_ids=target_users,
             )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-            log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
-            return web.json_response({"status": "review_triggered"})
+        log.info("review.triggered", repo=repo, pr_number=pr_number, action=action)
+        return web.json_response({"status": "review_triggered"})
 
     # ── Issue triage routing ────────────────────────────────────
     # When issue triage is enabled, opened issues are routed to the
@@ -526,40 +548,31 @@ async def _handle_github(request: web.Request) -> web.Response:
     # _fmt_issues() notification (richer content). Non-triaged actions
     # (closed, reopened) still fall through to the standard formatter.
     issue_triage_enabled = request.app.get("issue_triage_enabled", False)
-    if issue_triage_enabled and event_type == "issues":
-        action = payload.get("action", "")
-        if action == "opened":
-            issue = payload.get("issue", {})
-            issue_number = issue.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
+    if issue_triage_enabled and event_type == "issues" and action == "opened":
+        issue = payload.get("issue", {})
+        issue_number = issue.get("number", 0)
 
-            if _should_skip_triage(repo, issue_number):
-                log.info(
-                    "Skipping triage of %s issue #%d (cooldown)",
-                    repo,
-                    issue_number,
-                )
-                return web.json_response({"msg": "triage_cooldown"})
+        if _should_skip_triage(repo, issue_number):
+            log.info("triage.cooldown", repo=repo, issue_number=issue_number)
+            return web.json_response({"msg": "triage_cooldown"})
 
-            _record_triage(repo, issue_number)
+        _record_triage(repo, issue_number)
+        target_users = _users_for_repo(repo, request.app)
 
-            task = asyncio.create_task(
-                triage.triage_issue(
-                    payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
-                    claude_user=request.app.get("claude_user"),
-                )
+        task = asyncio.create_task(
+            triage.triage_issue(
+                payload,
+                webhook_port=request.app["webhook_port"],
+                webhook_secret=request.app["webhook_secret"],
+                claude_user=request.app.get("claude_user"),
+                user_ids=target_users,
             )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-            log.info(
-                "Issue triage triggered for %s issue #%d",
-                repo,
-                issue_number,
-            )
-            return web.json_response({"status": "triage_triggered"})
+        log.info("triage.triggered", repo=repo, issue_number=issue_number)
+        return web.json_response({"status": "triage_triggered"})
 
     # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type
@@ -571,20 +584,28 @@ async def _handle_github(request: web.Request) -> web.Response:
     if not message:
         return web.json_response({"msg": "ignored", "event": event_type})
 
-    # Send to Telegram with Markdown, falling back to plain text on parse failure
-    try:
-        await bot.send_message(chat_id, message, parse_mode="Markdown")
-    except Exception:
+    # Send to repo-relevant users who have GitHub notifications enabled (default: on)
+    target_users = _users_for_repo(repo, request.app) if repo else list(request.app["allowed_user_ids"])
+    sent_count = 0
+    for uid in target_users:
+        pref = await sessions.get_setting(uid, "github_notifications")
+        if pref == "false":
+            continue
         try:
-            await bot.send_message(chat_id, _strip_markdown(message))
+            await bot.send_message(uid, message, parse_mode="Markdown")
+            sent_count += 1
         except Exception:
-            log.exception("Failed to send GitHub notification")
-            return web.json_response({"msg": "error"})
-    log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
+            try:
+                await bot.send_message(uid, _strip_markdown(message))
+                sent_count += 1
+            except Exception:
+                log.exception("github.notify_failed", user_id=uid)
+    log.info("github.notified", event_type=event_type, sent_count=sent_count)
 
     return web.json_response({"status": "ok"})
 
 
+@log_route("generic_webhook")
 @_require_secret
 async def _handle_generic(request: web.Request) -> web.Response:
     """
@@ -595,12 +616,13 @@ async def _handle_generic(request: web.Request) -> web.Response:
     4096-char limit.
     """
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
 
     try:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
+
+    audit_webhook_event("generic", source=request.remote)
 
     # Use the "message" field if present (including empty string),
     # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
@@ -609,12 +631,53 @@ async def _handle_generic(request: web.Request) -> web.Response:
     if len(text) > 4096:
         text = text[:4093] + "..."
 
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception:
-        log.exception("Failed to send generic webhook notification")
+    # Generic webhooks are broadcast to all users with preference check.
+    # Unlike GitHub webhooks, generic sources have no repo context for routing.
+    for uid in request.app["allowed_user_ids"]:
+        pref = await sessions.get_setting(uid, "webhook_notifications")
+        if pref == "false":
+            continue
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            log.exception("generic_webhook.notify_failed", user_id=uid)
 
     return web.json_response({"status": "ok"})
+
+
+# ── User identification for internal APIs ────────────────────────────
+
+
+def _extract_user_id(request: web.Request, body: dict | None = None) -> int | None:
+    """Extract user_id from X-User-Id header or request body chat_id.
+
+    Returns None if no valid user_id is found or the user is not in the
+    allowed set. Callers should handle None by returning 403.
+    """
+    allowed: set[int] = request.app["allowed_user_ids"]
+
+    # Try X-User-Id header first
+    raw = request.headers.get("X-User-Id")
+    if raw:
+        try:
+            uid = int(raw)
+            if uid in allowed:
+                return uid
+        except ValueError:
+            pass
+
+    # Try chat_id in body (for backwards compatibility)
+    if body and "chat_id" in body:
+        try:
+            cid = int(body["chat_id"])
+            if cid in allowed:
+                return cid
+        except (ValueError, TypeError):
+            pass
+
+    # No fallback — if user can't be identified, return None (callers handle with 403)
+    log.warning("Could not extract user_id from request (no valid X-User-Id header or chat_id)")
+    return None
 
 
 # ── Scheduling API ───────────────────────────────────────────────────
@@ -626,6 +689,7 @@ _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 _VALID_JOB_TYPES = ("reminder", "claude")
 
 
+@log_route("schedule_job")
 @_require_secret
 async def _handle_schedule(request: web.Request) -> web.Response:
     """
@@ -678,7 +742,10 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
-    chat_id = request.app["chat_id"]
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    chat_id = payload.get("chat_id", user_id)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -689,6 +756,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     # Persist to database
     try:
         job_id = await sessions.create_job(
+            user_id=user_id,
             chat_id=chat_id,
             name=name,
             job_type=job_type,
@@ -706,13 +774,14 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     telegram_app = request.app["telegram_app"]
     await cron.register_job_by_id(telegram_app, job_id)
 
-    log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
+    log.info("job.created", job_id=job_id, name=name, schedule_type=schedule_type)
     return web.json_response({"job_id": job_id, "name": name})
 
 
 # ── Jobs API ─────────────────────────────────────────────────────────
 
 
+@log_route("get_jobs")
 @_require_secret
 async def _handle_get_jobs(request: web.Request) -> web.Response:
     """
@@ -722,17 +791,21 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     without needing to parse Telegram bot command output.
     """
 
-    chat_id = request.app["chat_id"]
-    jobs = await sessions.get_jobs(chat_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    jobs = await sessions.get_jobs(user_id)
     return web.json_response(jobs)
 
 
+@log_route("get_job")
 @_require_secret
 async def _handle_get_job(request: web.Request) -> web.Response:
     """
     Get a single job by its database ID.
 
     Returns the full job record as JSON, or 404 if not found.
+    Only returns jobs owned by the authenticated user.
     """
 
     try:
@@ -740,12 +813,17 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    job = await sessions.get_job_by_id(job_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+
+    job = await sessions.get_job_by_id(job_id, user_id=user_id)
     if not job:
         return web.json_response({"error": "Job not found"}, status=404)
     return web.json_response(job)
 
 
+@log_route("delete_job")
 @_require_secret
 async def _handle_delete_job(request: web.Request) -> web.Response:
     """
@@ -753,7 +831,7 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
 
     Removes the job from both the database and APScheduler's in-memory
     queue. Uses the same logic as the /canceljob Telegram command.
-    Returns 404 if the job doesn't exist.
+    Returns 404 if the job doesn't exist or belongs to another user.
     """
 
     try:
@@ -761,7 +839,11 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    deleted = await sessions.delete_job(job_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+
+    deleted = await sessions.delete_job(job_id, user_id=user_id)
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
 
@@ -776,10 +858,11 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
         if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
             j.schedule_removal()
 
-    log.info("Deleted job %d via API", job_id)
+    log.info("job.deleted", job_id=job_id)
     return web.json_response({"deleted": job_id})
 
 
+@log_route("update_job")
 @_require_secret
 async def _handle_update_job(request: web.Request) -> web.Response:
     """
@@ -790,13 +873,18 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     are updated. If the schedule changes (type or data), the job is
     re-registered with APScheduler to pick up the new timing.
 
-    Returns 404 if the job doesn't exist or is inactive.
+    Returns 404 if the job doesn't exist, is inactive, or belongs to
+    another user.
     """
 
     try:
         job_id = int(request.match_info["id"])
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
+
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
 
     try:
         payload = await request.json()
@@ -818,6 +906,7 @@ async def _handle_update_job(request: web.Request) -> web.Response:
 
     updated = await sessions.update_job(
         job_id,
+        user_id=user_id,
         name=payload.get("name"),
         prompt=payload.get("prompt"),
         schedule_type=new_schedule_type,
@@ -844,13 +933,14 @@ async def _handle_update_job(request: web.Request) -> web.Response:
         # Re-register with new schedule
         await cron.register_job_by_id(telegram_app, job_id)
 
-    log.info("Updated job %d via API", job_id)
+    log.info("job.updated", job_id=job_id)
     return web.json_response({"updated": job_id})
 
 
 # ── Service proxy ────────────────────────────────────────────────────
 
 
+@log_route("service_proxy")
 @_require_secret
 async def _handle_service_call(request: web.Request) -> web.Response:
     """
@@ -887,12 +977,18 @@ async def _handle_service_call(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         pass  # No body is fine — all fields are optional
 
+    t0 = time.monotonic()
     result = await services.call_service(
         service_name,
         body=body,
         params=params,
         path_suffix=path_suffix,
     )
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    raw_uid = request.headers.get("X-User-Id")
+    uid = int(raw_uid) if raw_uid and raw_uid.isdigit() else None
+    audit_service_call(service_name, user_id=uid, status=result.status, duration_ms=elapsed_ms)
 
     if result.success:
         return web.json_response({"status": result.status, "body": result.body})
@@ -903,6 +999,7 @@ async def _handle_service_call(request: web.Request) -> web.Response:
 # ── Messaging ────────────────────────────────────────────────────────
 
 
+@log_route("send_message")
 @_require_secret
 async def _handle_send_message(request: web.Request) -> web.Response:
     """
@@ -928,7 +1025,10 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    chat_id = payload.get("chat_id", user_id)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -952,16 +1052,17 @@ async def _handle_send_message(request: web.Request) -> web.Response:
                 await bot.send_message(chat_id, remaining[:cut])
                 remaining = remaining[cut:].lstrip("\n")
     except Exception:
-        log.exception("Failed to send message to chat %d via API", chat_id)
+        log.exception("send_message.failed", chat_id=chat_id)
         return web.json_response({"error": "Failed to send message"}, status=500)
 
-    log.info("Sent message to chat %d via API (%d chars)", chat_id, len(text))
+    log.info("send_message.sent", chat_id=chat_id, chars=len(text))
     return web.json_response({"status": "sent"})
 
 
 # ── File exchange ────────────────────────────────────────────────────
 
 
+@log_route("send_file")
 @_require_secret
 async def _handle_send_file(request: web.Request) -> web.Response:
     """
@@ -995,20 +1096,35 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # prefix matching which is bypassable via symlinks.
     # Fail closed: if workspace is somehow unset, deny all file access
     # rather than allowing reads from anywhere on the filesystem.
-    workspace = request.app.get("workspace")
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    # Look up the user's workspace from the per-user workspace mapping
+    user_workspaces = request.app.get("user_workspaces", {})
+    workspace = user_workspaces.get(user_id)
     if not workspace:
-        return web.json_response({"error": "No workspace configured"}, status=403)
+        workspace = str(DATA_DIR / "users" / str(user_id) / "home")
+
+    # Allow files from the user's workspace AND their per-user directory
+    # (covers session files, home workspace files, etc.)
     workspace_resolved = Path(workspace).resolve()
-    try:
-        path.relative_to(workspace_resolved)
-    except ValueError:
-        return web.json_response({"error": "Path outside workspace"}, status=403)
+    user_base_resolved = (DATA_DIR / "users" / str(user_id)).resolve()
+    allowed = False
+    for base in [workspace_resolved, user_base_resolved]:
+        try:
+            path.relative_to(base)
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        return web.json_response({"error": "Path outside allowed directories"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    chat_id = payload.get("chat_id", user_id)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1022,10 +1138,10 @@ async def _handle_send_file(request: web.Request) -> web.Response:
             with open(path, "rb") as f:
                 await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
     except Exception:
-        log.exception("Failed to send file %s to chat %d", path, chat_id)
+        log.exception("send_file.failed", path=str(path), chat_id=chat_id)
         return web.json_response({"error": "Failed to send file"}, status=500)
 
-    log.info("Sent file %s to chat %d via API", path.name, chat_id)
+    log.info("send_file.sent", file=path.name, chat_id=chat_id)
     return web.json_response({"status": "sent", "file": path.name})
 
 
@@ -1089,7 +1205,7 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
             prev_pending = current_pending
 
             if needs_reregister:
-                log.warning("Webhook health: %s - re-registering", reason)
+                log.warning("webhook.health_failed", reason=reason)
                 await bot.delete_webhook()
                 await bot.set_webhook(
                     url=webhook_url,
@@ -1135,16 +1251,11 @@ async def start(telegram_app, config) -> None:
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
-    # Use first allowed user ID as the notification target.
-    # Config validation ensures allowed_user_ids is non-empty, but guard
-    # against edge cases to avoid a StopIteration crash at startup.
-    chat_id = next(iter(config.allowed_user_ids), None)
-    if chat_id is None:
-        raise SystemExit("No allowed user IDs configured; cannot start webhook server")
-    _app["chat_id"] = chat_id
+    # Store all allowed user IDs for multi-user routing
+    _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Store workspace path for send-file path confinement
-    _app["workspace"] = str(config.claude_workspace)
+    # Per-user workspace mapping (populated as users switch workspaces)
+    _app["user_workspaces"] = {}
 
     # PR review agent config - stored in app for access by _handle_github()
     _app["pr_review_enabled"] = config.pr_review_enabled
@@ -1192,7 +1303,7 @@ async def start(telegram_app, config) -> None:
     # so there's no reason to expose the server on the LAN.
     site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
-    log.info("Webhook server listening on port %d", config.webhook_port)
+    log.info("webhook.listening", port=config.webhook_port)
 
     # Register the webhook URL with Telegram's API if in webhook mode. This must
     # come after the server is listening so the endpoint is ready before Telegram
@@ -1213,11 +1324,11 @@ async def start(telegram_app, config) -> None:
                     allowed_updates=["message", "callback_query"],
                 )
                 _webhook_registered = True
-                log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+                log.info("webhook.telegram_registered", url=config.telegram_webhook_url)
                 break
             except Exception:
                 if attempt == max_attempts:
-                    log.exception("Failed to register webhook after %d attempts", max_attempts)
+                    log.exception("webhook.telegram_register_failed", attempts=max_attempts)
                     raise
                 wait = 2**attempt  # 2, 4, 8, 16s
                 log.warning(
@@ -1285,11 +1396,13 @@ def is_running() -> bool:
     return _runner is not None
 
 
-def update_workspace(workspace: str) -> None:
+# Thread-safety: dict assignment is atomic in CPython and this function is only
+# called from the single-threaded asyncio event loop. No lock needed.
+def update_workspace(user_id: int, workspace: str) -> None:
     """
     Update the workspace path used by the send-file endpoint's confinement check.
 
-    Called by _do_switch_workspace in bot.py whenever the user switches workspaces,
+    Called by _do_switch_workspace in bot.py whenever a user switches workspaces,
     and by main.py after startup if a non-default workspace was restored from the
     settings table. Without this, the confinement check keeps using the initial
     home workspace path set at startup, causing send-file to return 403 for any
@@ -1300,7 +1413,9 @@ def update_workspace(workspace: str) -> None:
     path from config and would overwrite an earlier call.
 
     Args:
+        user_id: Telegram user ID whose workspace is changing.
         workspace: Absolute path string of the new current workspace.
     """
     if _app is not None:
-        _app["workspace"] = workspace
+        workspaces = _app.setdefault("user_workspaces", {})
+        workspaces[user_id] = workspace

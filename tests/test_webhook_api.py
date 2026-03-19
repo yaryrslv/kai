@@ -43,12 +43,14 @@ def mock_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_app": MagicMock(),
+        "allowed_user_ids": {123},
+        "user_workspaces": {},
     }
     # Mock the job_queue on the telegram app
     job_queue = MagicMock()
     job_queue.jobs = MagicMock(return_value=[])
     request.app["telegram_app"].job_queue = job_queue
-    request.headers = {}
+    request.headers = {"X-User-Id": "123"}
     request.match_info = {}
     return request
 
@@ -59,8 +61,7 @@ def mock_request():
 class TestScheduleJobType:
     async def test_invalid_job_type_returns_400(self, db, mock_request):
         """Schedule endpoint rejects unrecognized job_type values."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.json = AsyncMock(
             return_value={
                 "name": "test",
@@ -80,8 +81,7 @@ class TestScheduleJobType:
 
     async def test_valid_job_type_accepted(self, db, mock_request):
         """Schedule endpoint accepts valid job_type values without error."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.app["telegram_app"].job_queue = MagicMock()
 
         # Mock register_job_by_id so we don't need a full APScheduler setup
@@ -113,6 +113,7 @@ class TestDeleteJob:
     async def test_delete_existing_job(self, db, mock_request):
         """DELETE handler removes a job and returns 200."""
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="test job",
             job_type="reminder",
@@ -121,7 +122,7 @@ class TestDeleteJob:
             schedule_data='{"run_at": "2026-02-20T10:00:00+00:00"}',
         )
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": str(job_id)}
 
         resp = await _handle_delete_job(mock_request)
@@ -138,7 +139,7 @@ class TestDeleteJob:
 
     async def test_delete_nonexistent_job_returns_404(self, db, mock_request):
         """DELETE handler returns 404 for nonexistent job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "999"}
 
         resp = await _handle_delete_job(mock_request)
@@ -150,7 +151,7 @@ class TestDeleteJob:
 
     async def test_delete_invalid_job_id_returns_400(self, db, mock_request):
         """DELETE handler returns 400 for non-numeric ID."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "not-a-number"}
 
         resp = await _handle_delete_job(mock_request)
@@ -177,6 +178,7 @@ class TestUpdateJob:
     async def test_update_name_only(self, db, mock_request):
         """PATCH handler updates only the name field."""
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="original name",
             job_type="reminder",
@@ -185,7 +187,7 @@ class TestUpdateJob:
             schedule_data='{"run_at": "2026-02-20T10:00:00+00:00"}',
         )
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": str(job_id)}
         # Mock the json() method to return the payload
         mock_request.json = AsyncMock(return_value={"name": "updated name"})
@@ -205,6 +207,7 @@ class TestUpdateJob:
     async def test_update_multiple_fields(self, db, mock_request):
         """PATCH handler updates multiple fields at once."""
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="old name",
             job_type="claude",
@@ -214,7 +217,7 @@ class TestUpdateJob:
             auto_remove=False,
         )
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": str(job_id)}
         mock_request.json = AsyncMock(
             return_value={
@@ -235,7 +238,7 @@ class TestUpdateJob:
 
     async def test_update_nonexistent_job_returns_404(self, db, mock_request):
         """PATCH handler returns 404 for nonexistent job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "999"}
         mock_request.json = AsyncMock(return_value={"name": "new name"})
 
@@ -246,6 +249,7 @@ class TestUpdateJob:
     async def test_update_invalid_schedule_type_returns_400(self, db, mock_request):
         """PATCH handler returns 400 for invalid schedule_type."""
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="test job",
             job_type="reminder",
@@ -254,7 +258,7 @@ class TestUpdateJob:
             schedule_data="{}",
         )
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": str(job_id)}
         mock_request.json = AsyncMock(return_value={"schedule_type": "invalid"})
 
@@ -268,6 +272,7 @@ class TestUpdateJob:
     async def test_update_empty_body_returns_404(self, db, mock_request):
         """PATCH handler with empty body returns 404 (no fields to update)."""
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="test job",
             job_type="reminder",
@@ -276,7 +281,7 @@ class TestUpdateJob:
             schedule_data="{}",
         )
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": str(job_id)}
         mock_request.json = AsyncMock(return_value={})
 
@@ -299,7 +304,7 @@ class TestUpdateJob:
         """PATCH handler returns 400 for malformed JSON."""
         from json import JSONDecodeError
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "1"}
         mock_request.json = AsyncMock(side_effect=JSONDecodeError("test", "doc", 0))
 
@@ -321,10 +326,10 @@ def send_file_request(tmp_path):
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
-        "chat_id": 123,
-        "workspace": str(tmp_path),
+        "allowed_user_ids": {123},
+        "user_workspaces": {123: str(tmp_path)},
     }
-    request.headers = {"X-Webhook-Secret": "test-secret"}
+    request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
     return request
 
 
@@ -410,9 +415,10 @@ def send_message_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
-        "chat_id": 123,
+        "allowed_user_ids": {123},
+        "user_workspaces": {},
     }
-    request.headers = {"X-Webhook-Secret": "test-secret"}
+    request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
     return request
 
 
@@ -475,22 +481,22 @@ class TestSendMessage:
 
 
 class TestUpdateWorkspace:
-    def test_updates_app_workspace(self, monkeypatch):
-        """update_workspace() changes the path stored in the live aiohttp app dict."""
+    def test_updates_user_workspace(self, monkeypatch):
+        """update_workspace() stores the path in the per-user workspace mapping."""
         # Simulate a running server by setting _app to a real Application instance
         app = web.Application()
-        app["workspace"] = "/original/workspace"
+        app["user_workspaces"] = {}
         monkeypatch.setattr(webhook_mod, "_app", app)
 
-        update_workspace("/switched/workspace")
+        update_workspace(123, "/switched/workspace")
 
-        assert app["workspace"] == "/switched/workspace"
+        assert app["user_workspaces"][123] == "/switched/workspace"
 
     def test_no_op_when_server_not_running(self, monkeypatch):
         """update_workspace() is a no-op (no exception) when the server hasn't started."""
         monkeypatch.setattr(webhook_mod, "_app", None)
         # Should not raise
-        update_workspace("/any/path")
+        update_workspace(123, "/any/path")
 
 
 # ── POST /webhook/telegram ─────────────────────────────────────────
@@ -579,7 +585,10 @@ def github_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
-        "chat_id": 12345,
+        "allowed_user_ids": {12345},
+        # Match the test repo name ("testuser/repo") so _users_for_repo routes
+        # notifications to our test user (unmatched repos get no notifications).
+        "user_workspaces": {12345: "/workspace/repo"},
     }
     request.headers = {}
     return request
@@ -600,6 +609,12 @@ def _github_push_payload() -> dict:
 
 
 class TestGitHubWebhook:
+    @pytest.fixture(autouse=True)
+    def _mock_notification_settings(self):
+        """Mock sessions.get_setting to allow notifications by default."""
+        with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
+
     async def test_valid_push_sends_markdown(self, github_request):
         """Valid signature + push event sends a Markdown-formatted message."""
         payload = _github_push_payload()
@@ -636,8 +651,8 @@ class TestGitHubWebhook:
         assert resp.status == 200
         assert bot.send_message.call_count == 2
 
-    async def test_both_sends_fail_returns_error(self, github_request):
-        """When both Markdown and plain text fail, returns error response."""
+    async def test_both_sends_fail_still_returns_ok(self, github_request):
+        """When both Markdown and plain text fail, errors are logged but response is still ok."""
         payload = _github_push_payload()
         body = json.dumps(payload).encode()
         github_request.read = AsyncMock(return_value=body)
@@ -651,7 +666,7 @@ class TestGitHubWebhook:
         resp = await _handle_github(github_request)
 
         body_json = json.loads(resp.body.decode())
-        assert body_json["msg"] == "error"
+        assert body_json["status"] == "ok"
 
     async def test_invalid_signature_returns_401(self, github_request):
         """Requests with an invalid HMAC signature are rejected."""
@@ -738,13 +753,20 @@ def generic_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
-        "chat_id": 12345,
+        "allowed_user_ids": {12345},
+        "user_workspaces": {},
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     return request
 
 
 class TestGenericWebhook:
+    @pytest.fixture(autouse=True)
+    def _mock_notification_settings(self):
+        """Mock sessions.get_setting to allow notifications by default."""
+        with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
+
     async def test_sends_message_field(self, generic_request):
         """Payload with a 'message' field sends that string to Telegram."""
         generic_request.json = AsyncMock(return_value={"message": "Alert: disk full"})
@@ -824,10 +846,10 @@ class TestGenericWebhook:
 class TestGetJobs:
     async def test_returns_active_jobs(self, db, mock_request):
         """Returns a list of active jobs for the configured chat."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
 
         await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="Job A",
             job_type="reminder",
@@ -836,6 +858,7 @@ class TestGetJobs:
             schedule_data='{"times": ["09:00"]}',
         )
         await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="Job B",
             job_type="claude",
@@ -854,8 +877,7 @@ class TestGetJobs:
 
     async def test_returns_empty_list_when_no_jobs(self, db, mock_request):
         """Returns an empty list when no jobs exist."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
 
         resp = await _handle_get_jobs(mock_request)
 
@@ -866,7 +888,6 @@ class TestGetJobs:
     async def test_missing_secret_returns_401(self, db, mock_request):
         """Missing webhook secret returns 401."""
         mock_request.headers = {}
-        mock_request.app["chat_id"] = 123
 
         resp = await _handle_get_jobs(mock_request)
 
@@ -879,8 +900,9 @@ class TestGetJobs:
 class TestGetJob:
     async def test_returns_existing_job(self, db, mock_request):
         """Returns the full job record for a valid ID."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         job_id = await sessions.create_job(
+            user_id=123,
             chat_id=123,
             name="My Job",
             job_type="reminder",
@@ -899,7 +921,7 @@ class TestGetJob:
 
     async def test_nonexistent_job_returns_404(self, db, mock_request):
         """Returns 404 for a job ID that doesn't exist."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "999"}
 
         resp = await _handle_get_job(mock_request)
@@ -908,7 +930,7 @@ class TestGetJob:
 
     async def test_invalid_id_returns_400(self, db, mock_request):
         """Returns 400 for a non-numeric job ID."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
         mock_request.match_info = {"id": "abc"}
 
         resp = await _handle_get_job(mock_request)
@@ -927,14 +949,104 @@ class TestGetJob:
         assert resp.status == 401
 
 
+# ── Job user_id isolation ──────────────────────────────────────────
+
+
+class TestJobUserIsolation:
+    """Verify that GET/DELETE/PATCH job endpoints enforce user_id ownership."""
+
+    async def _create_job_for_user(self, user_id: int) -> int:
+        return await sessions.create_job(
+            user_id=user_id,
+            chat_id=user_id,
+            name=f"job-{user_id}",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+
+    async def test_get_own_job_succeeds(self, db, mock_request):
+        """GET /api/jobs/{id} returns a job owned by the requesting user."""
+        job_id = await self._create_job_for_user(123)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["id"] == job_id
+
+    async def test_get_other_users_job_returns_404(self, db, mock_request):
+        """GET /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 404
+
+    async def test_delete_other_users_job_returns_404(self, db, mock_request):
+        """DELETE /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 404
+        # Job still exists in database (not deleted)
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+
+    async def test_update_other_users_job_returns_404(self, db, mock_request):
+        """PATCH /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"name": "hijacked"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 404
+        # Job name unchanged
+        job = await sessions.get_job_by_id(job_id)
+        assert job["name"] == "job-999"
+
+    async def test_get_missing_user_id_returns_403(self, db, mock_request):
+        """GET /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        job_id = await self._create_job_for_user(123)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["allowed_user_ids"] = {123}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 403
+
+    async def test_delete_missing_user_id_returns_403(self, db, mock_request):
+        """DELETE /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 403
+
+    async def test_update_missing_user_id_returns_403(self, db, mock_request):
+        """PATCH /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+        mock_request.json = AsyncMock(return_value={"name": "new"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 403
+
+
 # ── POST /api/schedule (additional coverage) ───────────────────────
 
 
 class TestScheduleValidation:
     async def test_missing_required_fields_returns_400(self, db, mock_request):
         """Returns 400 when required fields are missing."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         # Missing prompt, schedule_type, and schedule_data
         mock_request.json = AsyncMock(return_value={"name": "incomplete"})
 
@@ -946,8 +1058,8 @@ class TestScheduleValidation:
 
     async def test_invalid_schedule_type_returns_400(self, db, mock_request):
         """Returns 400 for unrecognized schedule_type."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "test",
@@ -965,8 +1077,8 @@ class TestScheduleValidation:
 
     async def test_dict_schedule_data_serialized_to_json(self, db, mock_request):
         """schedule_data as a dict is serialized to a JSON string for DB storage."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "dict test",
@@ -988,8 +1100,8 @@ class TestScheduleValidation:
 
     async def test_string_schedule_data_passed_through(self, db, mock_request):
         """schedule_data as a pre-serialized string is stored as-is."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "string test",
@@ -1009,8 +1121,8 @@ class TestScheduleValidation:
 
     async def test_defaults_for_optional_fields(self, db, mock_request):
         """auto_remove defaults to False when omitted. job_type defaults to 'reminder'."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "defaults test",
@@ -1031,8 +1143,8 @@ class TestScheduleValidation:
 
     async def test_db_failure_returns_500(self, db, mock_request):
         """Database create failure returns 500 with an error message."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "fail test",
@@ -1054,8 +1166,8 @@ class TestScheduleValidation:
 
     async def test_successful_creation_registers_with_scheduler(self, db, mock_request):
         """Successful job creation calls register_job_by_id with the new ID."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(
             return_value={
                 "name": "scheduler test",
@@ -1073,8 +1185,8 @@ class TestScheduleValidation:
 
     async def test_invalid_json_returns_400(self, db, mock_request):
         """Malformed JSON body returns 400."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        mock_request.app["chat_id"] = 123
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
         mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
 
         resp = await _handle_schedule(mock_request)

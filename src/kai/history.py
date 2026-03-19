@@ -6,40 +6,51 @@ Provides functionality to:
 2. Retrieve recent messages for injection into new Claude sessions
 3. Serve as the "episodic memory" layer of Kai's three-layer memory system
 
-Log files are stored in workspace/.claude/history/ as date-stamped JSONL files
-(e.g., 2026-02-11.jsonl). Each line is a JSON object with fields:
-    ts       — ISO 8601 timestamp
-    dir      — "user" or "assistant"
-    chat_id  — Telegram chat ID
-    text     — message text
-    media    — optional dict with media metadata (type, filename, duration)
+Log files are stored per-user in {DATA_DIR}/users/{user_id}/home/.claude/history/
+as date-stamped JSONL files (e.g., 2026-02-11.jsonl). Each line is a JSON object
+with fields:
+    ts       -- ISO 8601 timestamp
+    dir      -- "user" or "assistant"
+    chat_id  -- Telegram chat ID
+    text     -- message text
+    media    -- optional dict with media metadata (type, filename, duration)
 
 The inner Claude Code instance can search these files directly with grep or jq
 when asked about past conversations. get_recent_history() provides a formatted
 summary of the last few messages for ambient recall at session start.
 """
 
+import asyncio
 import json
-import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
-from kai.config import PROJECT_ROOT
+import structlog
 
-log = logging.getLogger(__name__)
+from kai.config import DATA_DIR
 
-# History files live inside the home workspace so the inner Claude can access them.
-# Intentionally NOT updated when workspace switches - all conversation history
-# stays in the canonical home workspace location regardless of active workspace.
-_LOG_DIR = PROJECT_ROOT / "workspace" / ".claude" / "history"
+log = structlog.get_logger("kai.history")
 
 # Limits for the recent-history summary injected at session start
 _MAX_RECENT_MESSAGES = 20
 _MAX_CHARS_PER_MESSAGE = 500
 
 
-def log_message(
+def _log_dir_for_user(user_id: int) -> Path:
+    """Return the per-user history log directory."""
+    return DATA_DIR / "users" / str(user_id) / "home" / ".claude" / "history"
+
+
+def _write_log_line(filepath: Path, record: dict) -> None:
+    """Synchronous helper — runs in a thread via asyncio.to_thread()."""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+async def log_message(
     *,
     direction: str,
+    user_id: int,
     chat_id: int,
     text: str,
     media: dict | None = None,
@@ -51,13 +62,18 @@ def log_message(
     response. Each message is written immediately (not batched) so the log
     stays current even if the process crashes mid-conversation.
 
+    Uses asyncio.to_thread() so file I/O does not block the event loop
+    during concurrent multi-user operation.
+
     Args:
         direction: "user" for inbound messages, "assistant" for Kai's responses.
+        user_id: Telegram user ID (determines which log directory to write to).
         chat_id: Telegram chat ID the message belongs to.
         text: The message text content.
         media: Optional metadata dict for non-text messages (photos, voice, documents).
     """
-    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir = _log_dir_for_user(user_id)
+    log_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(UTC)
     record = {
         "ts": now.isoformat(),
@@ -66,15 +82,14 @@ def log_message(
         "text": text,
         "media": media,
     }
-    filepath = _LOG_DIR / f"{now.strftime('%Y-%m-%d')}.jsonl"
+    filepath = log_dir / f"{now.strftime('%Y-%m-%d')}.jsonl"
     try:
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        await asyncio.to_thread(_write_log_line, filepath, record)
     except OSError:
-        log.exception("Failed to write chat log")
+        log.exception("history.write_failed")
 
 
-def get_recent_history() -> str:
+def get_recent_history(user_id: int) -> str:
     """
     Return a formatted summary of recent messages, scanning back as needed.
 
@@ -86,16 +101,20 @@ def get_recent_history() -> str:
     to give Kai ambient awareness of recent conversations without loading the
     full history. Long messages are truncated and the total count is capped.
 
+    Args:
+        user_id: Telegram user ID whose history to retrieve.
+
     Returns:
         A newline-separated string of formatted messages like
         "[2026-02-11 07:00] You: hello", or an empty string if no history exists.
     """
-    if not _LOG_DIR.exists():
+    log_dir = _log_dir_for_user(user_id)
+    if not log_dir.exists():
         return ""
 
     # List all JSONL files and sort newest-first (ISO date filenames sort
     # lexicographically, so reversed gives us most recent first)
-    files = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)
+    files = sorted(log_dir.glob("*.jsonl"), reverse=True)
     if not files:
         return ""
 
@@ -108,7 +127,7 @@ def get_recent_history() -> str:
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError:
-            log.exception("Failed to read history file %s", path)
+            log.exception("history.read_failed", path=str(path))
             continue
         for line in raw.splitlines():
             if line.strip():
@@ -116,7 +135,7 @@ def get_recent_history() -> str:
                     file_messages.append(json.loads(line))
                 except json.JSONDecodeError:
                     # Skip individual bad lines rather than discarding the whole file
-                    log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
+                    log.debug("history.malformed_line", file=path.name, line=line[:100])
 
         # Prepend this file's messages (older days go before newer days)
         messages = file_messages + messages
